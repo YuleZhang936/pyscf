@@ -169,6 +169,27 @@ class _SmearingSCF:
         else:
             f_occ = _gaussian_smearing_occ
 
+        if self.istype('DHF'):
+            nocc = self.mol.nelectron
+            mo_es = numpy.asarray(mo_energy)
+            n4c = mo_es.size
+            n2c = n4c // 2
+            mo_es_pos = mo_es[n2c:]
+            if self.mu0 is None:
+                mu, mo_occ_pos = _smearing_optimize(f_occ, mo_es_pos, nocc, sigma)
+            else:
+                mu = self.mu0
+                mo_occ_pos = f_occ(mu, mo_es_pos, sigma)
+            mo_occs = numpy.zeros_like(mo_es)
+            mo_occs[n2c:] = mo_occ_pos
+            self.entropy = self._get_entropy(mo_es_pos, mo_occ_pos, mu)
+            fermi = _get_fermi(mo_es_pos, nocc)
+            logger.debug(self, '    Fermi level %g  Sum mo_occ = %s  should equal nelec = %s',
+                         fermi, mo_occ_pos.sum(), nocc)
+            logger.info(self, '    sigma = %g  Optimized mu = %.12g  entropy = %.12g',
+                        sigma, mu, self.entropy)
+            return mo_occs
+
         if self.fix_spin and is_uhf: # spin separated fermi level
             mo_es = mo_energy
             nocc = self.nelec
