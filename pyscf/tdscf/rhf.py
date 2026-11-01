@@ -32,7 +32,8 @@ from pyscf import ao2mo
 from pyscf import symm
 from pyscf.lib import logger
 from pyscf.scf import hf_symm
-from pyscf.scf import _response_functions # noqa
+from pyscf.scf import _response_functions
+from pyscf.gto.ppnl_velgauge import get_gth_pp_nl_velgauge_commutator
 from pyscf.data import nist
 from pyscf.tdscf._lr_eig import eigh as lr_eigh, eig as lr_eig, real_eig
 from pyscf import __config__
@@ -133,11 +134,15 @@ def _get_x_sym_table(td):
     orbsym = orbsym % 10  # convert to D2h irreps
     return orbsym[mo_occ==2,None] ^ orbsym[mo_occ==0]
 
-def get_ab(mf, frozen=None, mo_energy=None, mo_coeff=None, mo_occ=None):
+def get_ab(mf, frozen=None, mo_energy=None, mo_coeff=None, mo_occ=None,
+           singlet=True):
     r'''A and B matrices for TDDFT response function.
 
     A[i,a,j,b] = \delta_{ab}\delta_{ij}(E_a - E_i) + (ai||jb)
     B[i,a,j,b] = (ai||bj)
+
+    For triplet excitations (singlet=False), the Coulomb term vanishes and
+    the exchange-correlation kernel is f_aa - f_ab in place of f_aa + f_ab.
 
     Ref: Chem Phys Lett, 256, 454
     '''
@@ -180,11 +185,19 @@ def get_ab(mf, frozen=None, mo_energy=None, mo_coeff=None, mo_occ=None):
     def add_hf_(a, b, hyb=1):
         eri_mo = ao2mo.general(mol, [orbo,mo,mo,mo], compact=False)
         eri_mo = eri_mo.reshape(nocc,nmo,nmo,nmo)
-        a += numpy.einsum('iabj->iajb', eri_mo[:nocc,nocc:,nocc:,:nocc]) * 2
+        if singlet:
+            a += numpy.einsum('iabj->iajb', eri_mo[:nocc,nocc:,nocc:,:nocc]) * 2
+            b += numpy.einsum('iajb->iajb', eri_mo[:nocc,nocc:,:nocc,nocc:]) * 2
         a -= numpy.einsum('ijba->iajb', eri_mo[:nocc,:nocc,nocc:,nocc:]) * hyb
-
-        b += numpy.einsum('iajb->iajb', eri_mo[:nocc,nocc:,:nocc,nocc:]) * 2
         b -= numpy.einsum('jaib->iajb', eri_mo[:nocc,nocc:,:nocc,nocc:]) * hyb
+
+    def eval_fxc(rho, xctype):
+        '''Half of the kernel f_aa + f_ab (singlet) or f_aa - f_ab (triplet)'''
+        if singlet:
+            return ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype)[2]
+        fxc = ni.eval_xc_eff(mf.xc, (rho*.5, rho*.5), deriv=2, xctype=xctype,
+                             spin=1)[2]
+        return (fxc[0,:,0] - fxc[0,:,1]) * .5
 
     if isinstance(mf, scf.hf.KohnShamDFT):
         ni = mf._numint
@@ -211,7 +224,7 @@ def get_ab(mf, frozen=None, mo_energy=None, mo_coeff=None, mo_occ=None):
             for ao, mask, weight, coords \
                     in ni.block_loop(mol, mf.grids, nao, ao_deriv, max_memory):
                 rho = make_rho(0, ao, mask, xctype)
-                fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype)[2]
+                fxc = eval_fxc(rho, xctype)
                 wfxc = fxc[0,0] * weight
 
                 rho_o = lib.einsum('rp,pi->ri', ao, orbo)
@@ -227,7 +240,7 @@ def get_ab(mf, frozen=None, mo_energy=None, mo_coeff=None, mo_occ=None):
             for ao, mask, weight, coords \
                     in ni.block_loop(mol, mf.grids, nao, ao_deriv, max_memory):
                 rho = make_rho(0, ao, mask, xctype)
-                fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype)[2]
+                fxc = eval_fxc(rho, xctype)
                 wfxc = fxc * weight
                 rho_o = lib.einsum('xrp,pi->xri', ao, orbo)
                 rho_v = lib.einsum('xrp,pi->xri', ao, orbv)
@@ -249,7 +262,7 @@ def get_ab(mf, frozen=None, mo_energy=None, mo_coeff=None, mo_occ=None):
             for ao, mask, weight, coords \
                     in ni.block_loop(mol, mf.grids, nao, ao_deriv, max_memory):
                 rho = make_rho(0, ao, mask, xctype)
-                fxc = ni.eval_xc_eff(mf.xc, rho, deriv=2, xctype=xctype)[2]
+                fxc = eval_fxc(rho, xctype)
                 wfxc = fxc * weight
                 rho_o = lib.einsum('xrp,pi->xri', ao, orbo)
                 rho_v = lib.einsum('xrp,pi->xri', ao, orbv)
@@ -304,6 +317,8 @@ def get_nto(tdobj, state=1, threshold=OUTPUT_THRESHOLD, verbose=None):
         basis. The first N_occ NTOs are occupied NTOs and the rest are virtual
         NTOs.
     '''
+    assert not numpy.iscomplexobj(tdobj.xy[0][0])
+
     if state == 0:
         logger.warn(tdobj, 'Excited state starts from 1. '
                     'Set state=1 for first excited state.')
@@ -405,6 +420,7 @@ def get_nto(tdobj, state=1, threshold=OUTPUT_THRESHOLD, verbose=None):
 
 
 def analyze(tdobj, verbose=None):
+    assert not numpy.iscomplexobj(tdobj.xy[0][0])
     log = logger.new_logger(tdobj, verbose)
     mol = tdobj.mol
     mask = tdobj.get_frozen_mask()
@@ -454,22 +470,26 @@ def analyze(tdobj, verbose=None):
                      i+1, dip[0], dip[1], dip[2], numpy.dot(dip, dip),
                      f_oscillator[i])
 
-        log.info('\n** Transition velocity dipole moments (imaginary part, AU) **')
-        log.info('state          X           Y           Z        Dip. S.      Osc.')
-        trans_v = tdobj.transition_velocity_dipole()
-        f_v = tdobj.oscillator_strength(gauge='velocity', order=0)
-        for i, ei in enumerate(tdobj.e):
-            v = trans_v[i]
-            log.info('%3d    %11.4f %11.4f %11.4f %11.4f %11.4f',
+        if tdobj.mol.ecp:
+            log.warn("ECP detected. Skipping calculation of transition velocity and "
+                     "magnetic dipole moments, which have not yet been implemented.")
+        else:
+            log.info('\n** Transition velocity dipole moments (imaginary part, AU) **')
+            log.info('state          X           Y           Z        Dip. S.      Osc.')
+            trans_v = tdobj.transition_velocity_dipole()
+            f_v = tdobj.oscillator_strength(gauge='velocity', order=0)
+            for i, ei in enumerate(tdobj.e):
+                v = trans_v[i]
+                log.info('%3d    %11.4f %11.4f %11.4f %11.4f %11.4f',
                      i+1, v[0], v[1], v[2], numpy.dot(v, v), f_v[i])
 
-        log.info('\n** Transition magnetic dipole moments (imaginary part, AU) **')
-        log.info('state          X           Y           Z')
-        trans_m = tdobj.transition_magnetic_dipole()
-        for i, ei in enumerate(tdobj.e):
-            m = trans_m[i]
-            log.info('%3d    %11.4f %11.4f %11.4f',
-                     i+1, m[0], m[1], m[2])
+            log.info('\n** Transition magnetic dipole moments (imaginary part, AU) **')
+            log.info('state          X           Y           Z')
+            trans_m = tdobj.transition_magnetic_dipole()
+            for i, ei in enumerate(tdobj.e):
+                m = trans_m[i]
+                log.info('%3d    %11.4f %11.4f %11.4f',
+                         i+1, m[0], m[1], m[2])
     return tdobj
 
 def _analyze_wfnsym(tdobj, x_sym, x):
@@ -500,13 +520,36 @@ def transition_dipole(tdobj, xy=None):
 def transition_velocity_dipole(tdobj, xy=None):
     '''Transition dipole moments in the velocity gauge (imaginary part only)
     '''
-    ints = tdobj.mol.intor('int1e_ipovlp', comp=3, hermi=2)
-    v = tdobj._contract_multipole(ints, hermi=False, xy=xy)
+    ints_p = tdobj.mol.intor('int1e_ipovlp', comp=3, hermi=0)
+    if tdobj.mol.pseudo:
+        r_vnl_commutator = get_gth_pp_nl_velgauge_commutator(tdobj.mol, q=numpy.zeros(3)).real
+    elif tdobj.mol.ecp:
+        raise NotImplementedError(
+            "The commutator term for transition velocity dipole with ECP\n"
+            "has not been implemented."
+        )
+    else:
+        r_vnl_commutator = 0.0
+    # velocity operator = p - i[r, V_nl]
+    # Because int1e_ipovlp is ( nabla \| ) = ( \| -nabla ) = p / i, we have
+    # Im [ vel. ] = int1e_ipovlp - [ r, V_nl ].
+    # Note that the matrix of [ r_a, V_nl ] (a = 1, 2, 3) is real and anti-Hermitian.
+    # References:
+    # [1] 10.1021/acs.jctc.2c00644
+    # [2] 10.1103/PhysRevB.62.4927
+
+    velocity_operator = ints_p - r_vnl_commutator
+    v = tdobj._contract_multipole(velocity_operator, hermi=False, xy=xy)
     return -v
 
 def transition_magnetic_dipole(tdobj, xy=None):
     '''Transition magnetic dipole moments (imaginary part only)'''
     mol = tdobj.mol
+    if mol.pseudo or mol.ecp:
+        raise NotImplementedError(
+            "The commutator term for velocity gauge transition magnetic\n"
+            "dipole with ECP or pseudopotentials has not been implemented."
+        )
     with mol.with_common_orig(_charge_center(mol)):
         ints = mol.intor('int1e_cg_irxp', comp=3, hermi=2)
     m_pol = tdobj._contract_multipole(ints, hermi=False, xy=xy)
@@ -525,6 +568,11 @@ def transition_velocity_quadrupole(tdobj, xy=None):
     '''Transition quadrupole moments in the velocity gauge (imaginary part only)
     '''
     mol = tdobj.mol
+    if mol.pseudo or mol.ecp:
+        raise NotImplementedError(
+            "The commutator term for velocity gauge transition quadrupole\n"
+            "with ECP or pseudopotentials has not been implemented."
+        )
     nao = mol.nao_nr()
     with mol.with_common_orig(_charge_center(mol)):
         ints = mol.intor('int1e_irp', comp=9, hermi=0).reshape(3,3,nao,nao)
@@ -536,6 +584,11 @@ def transition_magnetic_quadrupole(tdobj, xy=None):
     '''Transition magnetic quadrupole moments (imaginary part only)'''
     XX, XY, XZ, YX, YY, YZ, ZX, ZY, ZZ = range(9)
     mol = tdobj.mol
+    if mol.pseudo or mol.ecp:
+        raise NotImplementedError(
+            "The commutator term for transition magnetic quadrupole\n"
+            "with ECP or pseudopotentials has not been implemented."
+        )
     nao = mol.nao_nr()
     with mol.with_common_orig(_charge_center(mol)):
         ints = mol.intor('int1e_irrp', comp=27, hermi=0).reshape(3,9,nao,nao)
@@ -559,6 +612,11 @@ def transition_velocity_octupole(tdobj, xy=None):
     '''Transition octupole moments in the velocity gauge (imaginary part only)
     '''
     mol = tdobj.mol
+    if mol.pseudo or mol.ecp:
+        raise NotImplementedError(
+            "The commutator term for velocity gauge transition octupole\n"
+            "with ECP or pseudopotentials has not been implemented."
+        )
     nao = mol.nao_nr()
     with mol.with_common_orig(_charge_center(mol)):
         ints = mol.intor('int1e_irrp', comp=27, hermi=0).reshape(3,3,3,nao,nao)
@@ -576,6 +634,7 @@ def _charge_center(mol):
 def _contract_multipole(tdobj, ints, hermi=True, xy=None):
     '''ints is the integral tensor of a spin-independent operator'''
     if xy is None: xy = tdobj.xy
+    assert not numpy.iscomplexobj(tdobj.xy[0][0])
     nstates = len(xy)
     pol_shape = ints.shape[:-2]
     nao = ints.shape[-1]
@@ -606,23 +665,23 @@ def oscillator_strength(tdobj, e=None, xy=None, gauge='length', order=0):
 
     if gauge == 'length':
         trans_dip = transition_dipole(tdobj, xy)
-        f = 2./3. * numpy.einsum('s,sx,sx->s', e, trans_dip, trans_dip)
+        f = 2./3. * numpy.einsum('s,sx,sx->s', e, trans_dip.conj(), trans_dip).real
         return f
 
     else:  # velocity gauge
         # Ref. JCP, 143, 234103
         trans_dip = transition_velocity_dipole(tdobj, xy)
-        f = 2./3. * numpy.einsum('s,sx,sx->s', 1./e, trans_dip, trans_dip)
+        f = 2./3. * numpy.einsum('s,sx,sx->s', 1./e, trans_dip.conj(), trans_dip).real
 
         if order > 0:
             m_dip = .5 * transition_magnetic_dipole(tdobj, xy)
-            f_m = numpy.einsum('s,sx,sx->s', e, m_dip, m_dip)
+            f_m = numpy.einsum('s,sx,sx->s', e, m_dip.conj(), m_dip)
             f_m = nist.ALPHA**2/6 * f_m.real
             f += f_m
 
             quad = .5 * transition_velocity_quadrupole(tdobj, xy)
-            f_quad = numpy.einsum('s,sxy,sxy->s', e, quad, quad)
-            f_quad-= 1./3 * numpy.einsum('s,sxx,sxx->s', e, quad, quad)
+            f_quad = numpy.einsum('s,sxy,sxy->s', e, quad.conj(), quad)
+            f_quad-= 1./3 * numpy.einsum('s,sxx,sxx->s', e, quad.conj(), quad)
             f_quad = nist.ALPHA**2/20 * f_quad.real
             f += f_quad
             logger.debug(tdobj, '    First order correction to oscillator '
@@ -631,13 +690,13 @@ def oscillator_strength(tdobj, e=None, xy=None, gauge='length', order=0):
 
         if order > 1:
             m_quad = -1./6 * 1j*transition_magnetic_quadrupole(tdobj, xy)
-            f_m = numpy.einsum('s,sy,szx,xyz->s', e, trans_dip*1j, m_quad,
+            f_m = numpy.einsum('s,sy,szx,xyz->s', e, trans_dip.conj()*1j, m_quad,
                                lib.LeviCivita)
             f_m = nist.ALPHA**3/9 * f_m.real
             f += f_m
 
             o_pol = -1./6 * 1j*transition_velocity_octupole(tdobj, xy)
-            f_o = numpy.einsum('s,sy,sxxy->s', e, trans_dip*1j, o_pol)
+            f_o = numpy.einsum('s,sy,sxxy->s', e, trans_dip.conj()*1j, o_pol)
             f_o = -2*nist.ALPHA**2/45 * f_o.real
             f += f_o
             logger.debug(tdobj, '    Second order correction to oscillator '
@@ -645,6 +704,31 @@ def oscillator_strength(tdobj, e=None, xy=None, gauge='length', order=0):
             logger.debug(tdobj, '    %s', f_m+f_o)
 
     return f
+
+def dipole_spectral_function(tdobj, e=None, xy=None, gauge='length', freqs=None, eta=1e-3):
+    """Dipole spectral function.
+
+    S(omega) = sum_n f_n delta(omega - Omega_n)
+    """
+    if e is None:
+        e = tdobj.e
+    f = tdobj.oscillator_strength(e=e, xy=xy, gauge=gauge)
+
+    def lorentz_broad(w, w0, eta):
+        # approximate a delta function by eta/(pi*((w-w0)^2+eta^2))
+        return eta / (numpy.pi * ((w-w0)**2 + eta**2))
+    spec = numpy.zeros_like(freqs)
+    for ei, fi in zip(e, f):
+        spec += fi * lorentz_broad(freqs, ei, eta)
+    return spec
+
+def photoabsorption_cross_section(tdobj, e=None, xy=None, gauge='length', freqs=None, eta=1e-3):
+    """Photoabsorption cross section.
+    sigma(omega) = 2 pi^2 / c * S(omega)
+    """
+    spec = tdobj.dipole_spectral_function(e=e, xy=xy, gauge=gauge, freqs=freqs, eta=eta)
+    # sigma = 2 pi^2 S(omega) / c
+    return 2 * numpy.pi**2 * spec / nist.LIGHT_SPEED
 
 
 def as_scanner(td):
@@ -720,6 +804,8 @@ class TDBase(lib.StreamObject):
         self.verbose = mf.verbose
         self.stdout = mf.stdout
         self.mol = mf.mol
+        if mf.mo_coeff is None and mf.mol.nelectron > 0:
+            mf.run()
         self._scf = mf
         self.max_memory = mf.max_memory
         self.chkfile = mf.chkfile
@@ -777,11 +863,6 @@ class TDBase(lib.StreamObject):
             log.warn('Ground state SCF is not converged')
         log.info('\n')
 
-    def check_sanity(self):
-        if self._scf.mo_coeff is None:
-            raise RuntimeError('SCF object is not initialized')
-        lib.StreamObject.check_sanity(self)
-
     def reset(self, mol=None):
         if mol is not None:
             self.mol = mol
@@ -806,7 +887,7 @@ class TDBase(lib.StreamObject):
     def get_ab(self, mf=None, frozen=None):
         if mf is None: mf = self._scf
         if frozen is None: frozen = self.frozen
-        return get_ab(mf, frozen=frozen)
+        return get_ab(mf, frozen=frozen, singlet=self.singlet)
 
     def get_precond(self, hdiag):
         def precond(x, e, *args):
@@ -830,6 +911,8 @@ class TDBase(lib.StreamObject):
     transition_velocity_octupole   = transition_velocity_octupole
     transition_magnetic_dipole     = transition_magnetic_dipole
     transition_magnetic_quadrupole = transition_magnetic_quadrupole
+    dipole_spectral_function       = dipole_spectral_function
+    photoabsorption_cross_section  = photoabsorption_cross_section
 
     as_scanner = as_scanner
 
@@ -844,7 +927,7 @@ class TDBase(lib.StreamObject):
         if not all(self.converged):
             logger.note(self, 'TD-SCF states %s not converged.',
                         [i for i, x in enumerate(self.converged) if not x])
-        logger.note(self, 'Excited State energies (eV)\n%s', self.e * nist.HARTREE2EV)
+        logger.note(self, 'Excitation energies (eV)\n%s', self.e * nist.HARTREE2EV)
         return self
 
     def to_gpu(self):
@@ -995,7 +1078,12 @@ class TDA(TDBase):
         from pyscf.grad import tdrhf
         return tdrhf.Gradients(self)
 
-    to_gpu = lib.to_gpu
+    def to_gpu(self):
+        import cupy as cp
+        out = lib.to_gpu(self)
+        if out.xy is not None:
+            out.xy = [(cp.asarray(x), y) for x, y in out.xy]
+        return out
 
 CIS = TDA
 
@@ -1086,7 +1174,8 @@ class TDHF(TDBase):
 
     Attributes:
         conv_tol : float
-            Diagonalization convergence tolerance.  Default is 1e-4.
+            Abosolute accuracy for eigenvalues in Davidson diagonalization.
+            Default is 1e-5.
         nstates : int
             Number of TD states to be computed. Default is 3.
 
@@ -1124,6 +1213,10 @@ class TDHF(TDBase):
         '''
         log = logger.new_logger(self)
         cpu0 = (logger.process_clock(), logger.perf_counter())
+        mf = self._scf
+        if mf.mo_energy is None:
+            mf.run()
+
         self.check_sanity()
         self.dump_flags()
         if nstates is None:
@@ -1194,7 +1287,12 @@ class TDHF(TDBase):
 
     Gradients = TDA.Gradients
 
-    to_gpu = lib.to_gpu
+    def to_gpu(self):
+        import cupy as cp
+        out = lib.to_gpu(self)
+        if out.xy is not None:
+            out.xy = [(cp.asarray(x), cp.asarray(y)) for x, y in out.xy]
+        return out
 
 RPA = TDRHF = TDHF
 

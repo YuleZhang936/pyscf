@@ -35,7 +35,7 @@ def kernel(mp, mo_energy=None, mo_coeff=None, eris=None, with_t2=WITH_T2,
     if mo_energy is not None or mo_coeff is not None:
         # For backward compatibility.  In pyscf-1.4 or earlier, mp.frozen is
         # not supported when mo_energy or mo_coeff is given.
-        assert (mp.frozen == 0 or mp.frozen is None)
+        assert mp.frozen is None
 
     if eris is None:      eris = mp.ao2mo(mo_coeff)
     if mo_energy is None: mo_energy = eris.mo_energy
@@ -180,6 +180,11 @@ class DFGMP2(gmp2.GMP2):
     # For non-canonical MP2
     def update_amps(self, t2, eris):
         raise NotImplementedError
+
+    def _reference_is_canonical(self):
+        # Non-canonical (f_ov != 0) references are not implemented for DF-GMP2;
+        # keep using the direct kernel to preserve the previous behavior.
+        return True
 
     def init_amps(self, mo_energy=None, mo_coeff=None, eris=None, with_t2=WITH_T2):
         return kernel(self, mo_energy, mo_coeff, eris, with_t2)

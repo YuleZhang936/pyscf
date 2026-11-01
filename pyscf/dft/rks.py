@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright 2014-2020 The PySCF Developers. All Rights Reserved.
+# Copyright 2014-2026 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ from pyscf.dft import gen_grid
 from pyscf.dft import numint
 from pyscf import __config__
 
-def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+def get_veff(ks, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
     '''Coulomb + XC functional
 
     .. note::
@@ -48,10 +48,10 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
             A density matrix or a list of density matrices
 
     Kwargs:
-        dm_last : ndarray or a list of ndarrays or 0
+        dm_last : ndarray or a list of ndarrays
             The density matrix baseline.  If not 0, this function computes the
             increment of HF potential w.r.t. the reference HF potential matrix.
-        vhf_last : ndarray or a list of ndarrays or 0
+        vhf_last : ndarray or a list of ndarrays
             The reference Vxc potential matrix.
         hermi : int
             Whether J, K matrix is hermitian
@@ -66,7 +66,8 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
     '''
     if mol is None: mol = ks.mol
     if dm is None: dm = ks.make_rdm1()
-    ks.initialize_grids(mol, dm)
+    if ks.grids.coords is None:
+        ks.initialize_grids(mol, dm)
 
     t0 = (logger.process_clock(), logger.perf_counter())
 
@@ -93,6 +94,7 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
         t0 = logger.timer(ks, 'vxc', *t0)
 
     incremental_jk = (ks._eri is None and ks.direct_scf and
+                      dm_last is not None and
                       getattr(vhf_last, 'vj', None) is not None)
     if incremental_jk:
         _dm = numpy.asarray(dm) - numpy.asarray(dm_last)
@@ -249,9 +251,10 @@ def energy_elec(ks, dm=None, h1e=None, vhf=None):
     e2 = ecoul + exc
 
     ks.scf_summary['e1'] = e1
+    ks.scf_summary['e2'] = e2
     ks.scf_summary['coul'] = ecoul
     ks.scf_summary['exc'] = exc
-    logger.debug(ks, 'E1 = %s  Ecoul = %s  Exc = %s', e1, ecoul, exc)
+    logger.debug(ks, 'E1 = %s  E2 = %s  Ecoul = %s  Exc = %s', e1, e2, ecoul, exc)
     return e1+e2, e2
 
 
@@ -315,6 +318,19 @@ class KohnShamDFT:
             Drop grids if their contribution to total electrons smaller than
             this cutoff value.  Default is 1e-7.
 
+        second_grids : Grids object
+            Secondary grids for SCF linear response functions (CPHF, TDDFT,
+            second-order SCF solvers, stability analysis, etc). If set, it is
+            used by ``mf.gen_response`` in place of ``self.grids``. A coarser
+            grid like level 1 is often sufficiently accurate.
+            Default is None (response functions use ``self.grids``).
+            Easy to assign with the helper method ``mf.set_second_grids``
+            (level 1 by default; 'sg1' for the SG1 standard grid).
+
+            >>> mol = gto.M(atom='H 0 0 0; H 0 0 1.2')
+            >>> mf = dft.RKS(mol).run()
+            >>> mf.set_second_grids(1)
+
     Examples:
 
     >>> mol = gto.M(atom='O 0 0 0; H 0 0 1; H 0 1 0', basis='ccpvdz', verbose=0)
@@ -324,22 +340,25 @@ class KohnShamDFT:
     -76.415443079840458
     '''
 
-    _keys = {'xc', 'nlc', 'grids', 'disp', 'nlcgrids', 'small_rho_cutoff'}
+    _keys = {'xc', 'nlc', 'grids', 'disp', 'gcp', 'nlcgrids', 'small_rho_cutoff',
+             'second_grids'}
 
     # Use rho to filter grids
-    small_rho_cutoff = getattr(__config__, 'dft_rks_RKS_small_rho_cutoff', 1e-7)
+    small_rho_cutoff = getattr(__config__, 'dft_rks_RKS_small_rho_cutoff', 0)
 
     def __init__(self, xc='LDA,VWN'):
         # By default, self.nlc = '' and self.disp = None
         self.xc = xc
         self.nlc = ''
         self.disp = None
+        self.gcp = None
         self.grids = gen_grid.Grids(self.mol)
         self.grids.level = getattr(
             __config__, 'dft_rks_RKS_grids_level', self.grids.level)
         self.nlcgrids = gen_grid.Grids(self.mol)
         self.nlcgrids.level = getattr(
             __config__, 'dft_rks_RKS_nlcgrids_level', self.nlcgrids.level)
+        self.second_grids = None
 ##################################################
 # don't modify the following attributes, they are not input options
         self._numint = numint.NumInt()
@@ -374,6 +393,10 @@ class KohnShamDFT:
             self.nlcgrids.dump_flags(verbose)
 
         log.info('small_rho_cutoff = %g', self.small_rho_cutoff)
+
+        if self.second_grids is not None:
+            log.info('** Secondary grids for response functions **')
+            self.second_grids.dump_flags(verbose)
         return self
 
     define_xc_ = define_xc_
@@ -469,24 +492,76 @@ class KohnShamDFT:
         The total energy and wave-function are the same as them in the input
         mean-field object.
         '''
-        from pyscf.dft import numint2c
         mf = scf.addons.convert_to_ghf(self)
         if xc is not None:
             mf.xc = xc
         mf.converged = xc == self.xc and mf.converged
-        if not isinstance(mf._numint, numint2c.NumInt2C):
-            mf._numint = numint2c.NumInt2C()
         return mf
 
     def reset(self, mol=None):
         hf.SCF.reset(self, mol)
         self.grids.reset(mol)
         self.nlcgrids.reset(mol)
+        if self.second_grids is not None:
+            self.second_grids.reset(mol)
         return self
+
+    def set_second_grids(self, level=1):
+        '''Assign the secondary grids for SCF linear response functions.
+
+        The secondary grids are used to evaluate the XC response kernels
+        of linear response properties (TDDFT, CPHF, Hessian, second-order
+        SCF solver, etc.). A coarser grid than the ground-state default
+        (level 3) is usually sufficiently accurate.
+
+        Args:
+            level : int or str or gen_grid.Grids
+                An int builds a gen_grid.Grids of the given level.
+                Useful values are 1 (recommended, supported for all
+                elements) and 2 (finer, closer to the ground-state grid).
+                'sg1' builds the SG1 standard grid (prune=sg1_prune,
+                atom_grid=(50,194)); SG1 radii are tabulated for Z <= 18
+                only. Other level numbers are allowed but generally do not
+                make much sense. A pre-built Grids object is used as-is.
+
+        Examples:
+
+        >>> mol = gto.M(atom='H 0 0 0; H 0 0 1.2')
+        >>> mf = dft.RKS(mol).run()
+        >>> mf.set_second_grids(1)   # or mf.set_second_grids('sg1')
+        '''
+        if isinstance(level, str):
+            if level.lower() != 'sg1':
+                raise ValueError(f'Unknown second_grids scheme {level!r}.')
+            self.second_grids = gen_grid.sg1_grids(self.mol)
+        elif isinstance(level, gen_grid.Grids):
+            self.second_grids = level
+        else:
+            grids = gen_grid.Grids(self.mol)
+            grids.level = int(level)
+            self.second_grids = grids
+        return self
+
+    def dft3c(self, method='b97-3c'):
+        '''Apply a composite 3c method (B97-3c, r2SCAN-3c or wB97X-3c) to
+        this object.
+
+        The method returns a new DFT3C object; the underlying Mole object
+        is rebuilt in place with the tailored basis of the method.  Density
+        fitting can be applied before or after the 3c setup, e.g.
+        ``mf.dft3c('b97-3c').density_fit().run()`` or
+        ``mf.density_fit().dft3c('b97-3c').run()``.
+
+        See :func:`pyscf.dft.dft3c.dft3c` for details.
+        '''
+        from pyscf.dft.dft3c import dft3c as dft3c_
+        return dft3c_(self, method=method)
 
     def check_sanity(self):
         out = super().check_sanity()
-        if self.do_nlc() and self.do_disp() and self._numint.libxc.is_nlc(self.xc):
+        if (self.do_nlc() and self.do_disp() and self._numint.libxc.is_nlc(self.xc)
+            # COACH combines VV10 with three-body contributions from D4
+            and self.xc.upper() != 'COACH'):
             import warnings
             warnings.warn(
                 f'nlc-type xc {self.xc} and disp {self.disp} may lead to'
@@ -534,7 +609,7 @@ def init_guess_by_vsap(mf, mol=None):
 
     # Form guess orbitals
     mo_energy, mo_coeff = mf.eig(hsap, s)
-    logger.debug(mf, 'VSAP mo energies\n{}'.format(mo_energy))
+    logger.debug(mf, f'VSAP mo energies\n{mo_energy}')
 
     # and guess density
     mo_occ = mf.get_occ(mo_energy, mo_coeff)

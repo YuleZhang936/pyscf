@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright 2014-2020 The PySCF Developers. All Rights Reserved.
+# Copyright 2014-2026 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,22 +18,16 @@
 
 import numpy
 import unittest
-import tempfile
 from pyscf import lib
 from pyscf import gto
 from pyscf import scf
+from pyscf.scf import _vhf
 from pyscf.scf import atom_hf
 
-import sys
 try:
-    import dftd3
-except ImportError:
-    pass
-
-try:
-    import dftd4
-except ImportError:
-    pass
+    from pyscf.dispersion import dftd3, dftd4
+except (ImportError, OSError):
+    dftd3 = dftd4 = None
 
 def setUpModule():
     global mol, mf, n2sym, n2mf, re_ecp1, re_ecp2
@@ -49,7 +43,7 @@ def setUpModule():
 
     mf = scf.RHF(mol)
     mf.conv_tol = 1e-10
-    mf.chkfile = tempfile.NamedTemporaryFile().name
+    mf.chkfile = lib.NamedTemporaryFile().name
     mf.kernel()
 
     n2sym = gto.M(
@@ -148,8 +142,8 @@ class KnownValues(unittest.TestCase):
         mol1.basis = 'sto3g'
         mol1.build(0, 0)
         dm = scf.hf.get_init_guess(mol1, key='minao')
-        self.assertAlmostEqual(lib.fp(dm), 1.3085066548762425, 9)
-        self.assertAlmostEqual(numpy.einsum('ij,ji->', dm, mol1.intor('int1e_ovlp')), 13.60436071945, 7)
+        self.assertAlmostEqual(lib.fp(dm), 1.3450111665976545, 9)
+        self.assertAlmostEqual(numpy.einsum('ij,ji->', dm, mol1.intor('int1e_ovlp')), 14, 9)
         mol1.stdout.close()
 
         mol.atom = [["O" , (0. , 0.     , 0.)],
@@ -167,14 +161,18 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(numpy.einsum('ij,ji->', dm, s), 15, 9)
 
         dm = scf.hf.get_init_guess(re_ecp2, key='minao')
-        self.assertAlmostEqual(lib.fp(dm), -9.0532680910696772, 9)
-        self.assertAlmostEqual(numpy.einsum('ij,ji->', dm, s), 31.804465975542513, 9)
+        self.assertAlmostEqual(lib.fp(dm), -31.696260932743616, 9)
+        self.assertAlmostEqual(numpy.einsum('ij,ji->', dm, s), 57, 9)
 
         mol = gto.M(atom=[['Mg',(0, 0, 0)], ['!Mg',(0, 1, 0)], ['O',(0, 0, 1)]],
                     basis={'O': 'sto3g', 'Mg': 'sto3g'},
                     ecp='lanl2dz')
         dm = mol.RHF().init_guess_by_minao()
-        self.assertAlmostEqual(lib.fp(dm), -0.8255591441786179, 9)
+        self.assertAlmostEqual(lib.fp(dm), -0.5821059405885507, 9)
+
+        mol = gto.M(atom='Ag', basis='def2-svp', ecp='def2-svp', spin=1)
+        dm = scf.hf.init_guess_by_minao(mol)
+        self.assertAlmostEqual(numpy.einsum('ij,ji->', dm, mol.intor('int1e_ovlp')), 19, 9)
 
     def test_init_guess_atom(self):
         mol = gto.M(
@@ -229,7 +227,7 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(scf_result['Cu'][0], -194.92388639203045, 9)
 
     def test_init_guess_chk(self):
-        dm = mol.HF(chkfile=tempfile.NamedTemporaryFile().name).get_init_guess(mol, key='chkfile')
+        dm = mol.HF(chkfile=lib.NamedTemporaryFile().name).get_init_guess(mol, key='chkfile')
         self.assertAlmostEqual(lib.fp(dm), 2.5912875957299684, 5)
 
         dm = mf.get_init_guess(mol, key='chkfile')
@@ -251,6 +249,12 @@ class KnownValues(unittest.TestCase):
 
     def test_init_guess_huckel(self):
         dm = scf.hf.RHF(mol).get_init_guess(mol, key='mod_huckel')
+        self.assertAlmostEqual(lib.fp(dm), 3.233072986208057, 5)
+
+        # init_guess_by_mod_huckel should be callable without arguments,
+        # consistent with init_guess_by_huckel and the UHF/ROHF/GHF/DHF
+        # implementations.
+        dm = scf.hf.RHF(mol).init_guess_by_mod_huckel()
         self.assertAlmostEqual(lib.fp(dm), 3.233072986208057, 5)
 
         dm = scf.ROHF(mol).init_guess_by_mod_huckel()
@@ -371,7 +375,7 @@ class KnownValues(unittest.TestCase):
     def test_scf(self):
         self.assertAlmostEqual(mf.e_tot, -76.026765673119627, 9)
 
-    @unittest.skipIf('dispersion' not in sys.modules, "requires the dftd3 library")
+    @unittest.skipIf(dftd3 is None, "requires the dftd3 library")
     def test_scf_d3(self):
         mf = scf.RHF(mol)
         mf.disp = 'd3bj'
@@ -380,7 +384,7 @@ class KnownValues(unittest.TestCase):
         e_tot = mf.kernel()
         self.assertAlmostEqual(e_tot, -76.03127458778653, 9)
 
-    @unittest.skipIf('dispersion' not in sys.modules, "requires the dftd4 library")
+    @unittest.skipIf(dftd4 is None, "requires the dftd4 library")
     def test_scf_d4(self):
         mf = scf.RHF(mol)
         mf.disp = 'd4'
@@ -484,6 +488,12 @@ H     0    0.757    0.587'''
         self.assertEqual(vhf4.ndim, 4)
         self.assertAlmostEqual(lib.fp(vhf4), 4.9026999849223287, 12)
         self.assertAlmostEqual(abs(vhf4[0]-vhf3).max(), 0, 12)
+
+        vhf5 = mf1.get_veff(pmol, dm[1,0], dm_last=dm[0,0],
+                            vhf_last=vhf2, hermi=0)
+        ref = mf1.get_veff(pmol, dm[1,0], hermi=0)
+        self.assertAlmostEqual(abs(ref - vhf5).max(), 0, 12)
+        self.assertAlmostEqual(vhf5.ecoul, ref.ecoul, 12)
 
     def test_hf_symm(self):
         pmol = mol.copy()
@@ -763,12 +773,12 @@ H     0    0.757    0.587'''
         self.assertAlmostEqual(mf_scanner(mol.atom), -76.075408156235909, 9)
 
         mol1 = gto.M(atom='H 0 0 0; H 0 0 .9', basis='cc-pvdz')
-        ref = mol1.RHF(chkfile=tempfile.NamedTemporaryFile().name).x2c().density_fit().run()
+        ref = mol1.RHF(chkfile=lib.NamedTemporaryFile().name).x2c().density_fit().run()
         e1 = mf_scanner('H 0 0 0; H 0 0 .9')
         self.assertAlmostEqual(e1, -1.116394048204042, 9)
         self.assertAlmostEqual(e1, ref.e_tot, 9)
 
-        mfs = mol1.RHF(chkfile=tempfile.NamedTemporaryFile().name).as_scanner()
+        mfs = mol1.RHF(chkfile=lib.NamedTemporaryFile().name).as_scanner()
         mfs.__dict__.update(scf.chkfile.load(ref.chkfile, 'scf'))
         e = mfs(mol1)
         self.assertAlmostEqual(e, -1.1163913004438035, 9)
@@ -901,10 +911,10 @@ H     0    0.757    0.587'''
         self.assertAlmostEqual(numpy.linalg.norm(vj1), 77.035779188661465, 9)
 
         orig = mf1.opt.prescreen
-        self.assertEqual(orig, scf._vhf._fpointer('CVHFnrs8_prescreen').value)
+        self.assertEqual(orig, _vhf._fpointer('CVHFnrs8_prescreen').value)
         mf1.opt.prescreen = orig
         mf1.opt.prescreen = 'CVHFnoscreen'
-        self.assertEqual(mf1.opt.prescreen, scf._vhf._fpointer('CVHFnoscreen').value)
+        self.assertEqual(mf1.opt.prescreen, _vhf._fpointer('CVHFnoscreen').value)
 
         # issue #1114
         dm = numpy.eye(nao, dtype=int)

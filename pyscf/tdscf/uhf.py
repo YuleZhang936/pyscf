@@ -419,6 +419,8 @@ def get_nto(tdobj, state=1, threshold=OUTPUT_THRESHOLD, verbose=None):
         basis. The first N_occ NTOs are occupied NTOs and the rest are virtual
         NTOs.
     '''
+    assert not numpy.iscomplexobj(tdobj.xy[0][0][0])
+
     if state == 0:
         logger.warn(tdobj, 'Excited state starts from 1. '
                     'Set state=1 for first excited state.')
@@ -562,6 +564,7 @@ def get_nto(tdobj, state=1, threshold=OUTPUT_THRESHOLD, verbose=None):
 
 
 def analyze(tdobj, verbose=None):
+    assert not numpy.iscomplexobj(tdobj.xy[0][0][0])
     log = logger.new_logger(tdobj, verbose)
     mol = tdobj.mol
     maska, maskb = tdobj.get_frozen_mask()
@@ -638,6 +641,7 @@ def analyze(tdobj, verbose=None):
 
 def _contract_multipole(tdobj, ints, hermi=True, xy=None):
     if xy is None: xy = tdobj.xy
+    assert not numpy.iscomplexobj(tdobj.xy[0][0][0])
     maska, maskb = tdobj.get_frozen_mask()
     mo_coeff = (tdobj._scf.mo_coeff[0][:, maska], tdobj._scf.mo_coeff[1][:, maskb])
     mo_occ = (tdobj._scf.mo_occ[0][maska], tdobj._scf.mo_occ[1][maskb])
@@ -739,6 +743,10 @@ class TDA(TDBase):
         '''TDA diagonalization solver
         '''
         cpu0 = (logger.process_clock(), logger.perf_counter())
+        mf = self._scf
+        if mf.mo_energy is None:
+            mf.run()
+
         self.check_sanity()
         self.dump_flags()
         if nstates is None:
@@ -795,7 +803,13 @@ class TDA(TDBase):
         from pyscf.grad import tduhf
         return tduhf.Gradients(self)
 
-    to_gpu = lib.to_gpu
+    def to_gpu(self):
+        import cupy as cp
+        out = lib.to_gpu(self)
+        if out.xy is not None:
+            out.xy = [((cp.asarray(xa), cp.asarray(xb)), y)
+                      for (xa, xb), y in out.xy]
+        return out
 
 CIS = TDA
 
@@ -911,6 +925,10 @@ class TDHF(TDBase):
         '''
         log = logger.new_logger(self)
         cpu0 = (logger.process_clock(), logger.perf_counter())
+        mf = self._scf
+        if mf.mo_energy is None:
+            mf.run()
+
         self.check_sanity()
         self.dump_flags()
         if nstates is None:
@@ -985,7 +1003,14 @@ class TDHF(TDBase):
 
     Gradients = TDA.Gradients
 
-    to_gpu = lib.to_gpu
+    def to_gpu(self):
+        import cupy as cp
+        out = lib.to_gpu(self)
+        if out.xy is not None:
+            out.xy = [((cp.asarray(xa), cp.asarray(xb)),
+                       (cp.asarray(ya), cp.asarray(yb)))
+                      for (xa, xb), (ya, yb) in out.xy]
+        return out
 
 RPA = TDUHF = TDHF
 

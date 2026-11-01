@@ -49,7 +49,7 @@ def get_nuc(mydf, kpts=None):
     k-mesh and return a (Nk, Nao, Nao) array.
 
     Note: This API has changed since PySCF-2.10. In PySCF 2.9 (or older), if
-    `kpts` is not specified, this funciton may return a (Nao, Nao) matrix for
+    `kpts` is not specified, this function may return a (Nao, Nao) matrix for
     the gamma point and a (Nk, Nao, Nao) array for other k-points.
     '''
     from pyscf.pbc.dft import gen_grid
@@ -89,7 +89,7 @@ def get_pp(mydf, kpts=None):
     k-mesh and return a (Nk, Nao, Nao) array.
 
     Note: This API has changed since PySCF-2.10. In PySCF 2.9 (or older), if
-    `kpts` is not specified, this funciton may return a (Nao, Nao) matrix for
+    `kpts` is not specified, this function may return a (Nao, Nao) matrix for
     the gamma point and a (Nk, Nao, Nao) array for other k-points.
     '''
     from pyscf.pbc.dft import gen_grid
@@ -138,7 +138,7 @@ def get_pp(mydf, kpts=None):
             pp = cell._pseudo[symb]
             p1 = 0
             for l, proj in enumerate(pp[5:]):
-                rl, nl, hl = proj
+                rl, nl, hl = proj[:3]
                 if nl > 0:
                     fakemol._bas[0,gto.ANG_OF] = l
                     fakemol._env[ptr+3] = .5*rl**2
@@ -161,7 +161,7 @@ def get_pp(mydf, kpts=None):
                 SPG_lm_aoGs = lib.zdot(SPG_lmi, aokG)
                 p1 = 0
                 for l, proj in enumerate(pp[5:]):
-                    rl, nl, hl = proj
+                    rl, nl, hl = proj[:3]
                     if nl > 0:
                         p0, p1 = p1, p1+nl*(l*2+1)
                         hl = numpy.asarray(hl)
@@ -206,7 +206,7 @@ class FFTDF(lib.StreamObject):
         # ~ Nele * error[rho(Ecut)] while in AFT the error is ~ error[rho(Ecut)]^2.
         # This is a first order error, same to the error estimation for nuclear
         # attraction.
-        self.mesh = cell.mesh
+        self._mesh = None
 
         # The following attributes are not input options.
         # self.exxdiv has no effects. It was set in the get_k_kpts function to
@@ -214,6 +214,16 @@ class FFTDF(lib.StreamObject):
         self.exxdiv = None
         self._numint = numint.KNumInt()
         self._rsh_df = {}  # Range separated Coulomb DF objects
+
+    @property
+    def mesh(self):
+        # Follow the current cell unless a DF mesh was explicitly assigned.
+        if self._mesh is None:
+            return self.cell.mesh
+        return self._mesh
+    @mesh.setter
+    def mesh(self, value):
+        self._mesh = value
 
     @property
     def grids(self):
@@ -247,6 +257,9 @@ class FFTDF(lib.StreamObject):
                 self._kpts.reset(cell)
             self.cell = cell
         self._rsh_df = {}
+        # _ws_exx may be attached to AFTDF by weighted_coulG() in
+        # pyscf/pbc/df/aft.py
+        self.__dict__.pop('_ws_exx', None)
         return self
 
     def dump_flags(self, verbose=None):

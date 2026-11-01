@@ -569,7 +569,7 @@ def kernel(casci, mo_coeff=None, ci0=None, verbose=logger.NOTE, envs=None):
         mo_coeff : ndarray
             orbitals to construct active space Hamiltonian
         ci0 : ndarray or custom types
-            FCI sovler initial guess. For external FCI-like solvers, it can be
+            FCI solver initial guess. For external FCI-like solvers, it can be
             overloaded different data type. For example, in the state-average
             FCI solver, ci0 is a list of ndarray. In other solvers such as
             DMRGCI solver, SHCI solver, ci0 are custom types.
@@ -1140,6 +1140,9 @@ class CASCI(CASBase):
         .e_tot, .e_cas, .ci, .mo_coeff, .mo_energy
         '''
         if mo_coeff is None:
+            if self.mo_coeff is None and self._scf.mol.nelectron > 0:
+                self._scf.run()
+                self.mo_coeff = self._scf.mo_coeff
             mo_coeff = self.mo_coeff
         else:
             self.mo_coeff = mo_coeff
@@ -1180,6 +1183,12 @@ class CASCI(CASBase):
     as_scanner = as_scanner
 
     def nuc_grad_method(self):
+        # Dispatch by orbital source.  HF-CASCI and KS-CASCI have different
+        # orbital-response equations.
+        from pyscf.scf import hf
+        if isinstance(self._scf, hf.KohnShamDFT):
+            from pyscf.grad import kscasci
+            return kscasci.Gradients(self)
         from pyscf.grad import casci
         return casci.Gradients(self)
 

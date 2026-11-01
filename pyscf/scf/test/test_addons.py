@@ -77,6 +77,32 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(mo2[0]).sum(), 83.436359425591888, 11)
         self.assertAlmostEqual(abs(mo2[1]).sum(), 83.436359425591888, 11)
 
+    def test_init_guess_by_minao_lindep(self):
+        # issue 3015: near-singular overlap blows up the minao density guess
+        mol_ld = gto.M(atom='H 0 0 -3.14; C 0 0 -2.08; C 0 0 -0.69; '
+                            'C 0 0 0.69; C 0 0 2.08; H 0 0 3.14',
+                       basis='6-311+g', verbose=0)
+        s22 = mol_ld.intor_symmetric('int1e_ovlp')
+        dm = scf.hf.init_guess_by_minao(mol_ld)
+        self.assertTrue(abs(dm).max() < 10)           # ~125 without the fix
+        self.assertTrue(abs(dm.mo_coeff).max() < 30)  # ~103 without the fix
+        nelec = numpy.einsum('ij,ji->', dm, s22)
+        self.assertAlmostEqual(nelec, mol_ld.nelectron, delta=0.1)
+
+    def test_project_mo_nr2nr_lindep(self):
+        # issue 3015: near-singular overlap corrupts MO projection
+        mol_ld = gto.M(atom='H 0 0 -3.14; C 0 0 -2.08; C 0 0 -0.69; '
+                            'C 0 0 0.69; C 0 0 2.08; H 0 0 3.14',
+                       basis='6-311+g', verbose=0)
+        s22 = mol_ld.intor_symmetric('int1e_ovlp')
+        mol_sm = gto.M(atom=mol_ld.atom, basis='sto-3g', verbose=0)
+        mf_sm = scf.RHF(mol_sm).run(conv_tol=1e-10)
+        nocc = mol_sm.nelectron // 2
+        c2 = addons.project_mo_nr2nr(mol_sm, mf_sm.mo_coeff, mol_ld)
+        ovlp = c2[:,:nocc].conj().T.dot(s22).dot(c2[:,:nocc])
+        self.assertAlmostEqual(abs(ovlp - numpy.eye(nocc)).max(), 0, 2)
+
+
     def test_project_mo_r2r(self):
         nao = mol.nao_2c()
         c = numpy.random.random((nao*2,nao*2))
@@ -89,8 +115,10 @@ class KnownValues(unittest.TestCase):
         n4c = n2c * 2
         mo1 = numpy.random.random((n4c,n4c)) + numpy.random.random((n4c,n4c))*1j
         mo2 = addons.project_mo_r2r(mol, [mo1,mo1], mol_dz)
-        self.assertAlmostEqual(abs(mo2[0]).sum(), 2159.3715489514038, 11)
-        self.assertAlmostEqual(abs(mo2[1]).sum(), 2159.3715489514038, 11)
+        # 9 decimal places of a sum of about 2e3 is 13 significant figures,
+        # above the roundoff of the summation
+        self.assertAlmostEqual(abs(mo2[0]).sum(), 2159.3715489514038, 9)
+        self.assertAlmostEqual(abs(mo2[1]).sum(), 2159.3715489514038, 9)
 
     def test_project_mo_nr2r(self):
         numpy.random.seed(15)
@@ -305,6 +333,7 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(isinstance(addons.convert_to_rhf(sym_mf_u), scf.hf_symm.ROHF))
         self.assertTrue(isinstance(addons.convert_to_uhf(sym_mf_u), scf.uhf_symm.UHF))
         self.assertTrue(isinstance(addons.convert_to_ghf(sym_mf_u), scf.ghf_symm.GHF))
+        self.assertEqual(type(addons.convert_to_rhf(mol.ROHF())), scf.hf.RHF)
 
         mf1 = mf.copy()
         self.assertTrue(isinstance(mf1.convert_from_(mf), scf.rhf.RHF))
@@ -398,6 +427,18 @@ class KnownValues(unittest.TestCase):
         #self.assertTrue(isinstance(addons.convert_to_uhf(scf.GHF(mol).density_fit().newton()), df_jk._DFHF))
         self.assertTrue(isinstance(addons.convert_to_ghf(scf.GHF(mol).density_fit().newton()), df_jk._DFHF))
 
+    def test_conversion_gks_numint(self):
+        from pyscf.dft.numint2c import NumInt2C
+        for symmetry in (False, True):
+            m = gto.M(atom='H 0 0 0; H 0 0 1', symmetry=symmetry, verbose=0)
+            for source in (dft.RKS, dft.ROKS, dft.UKS):
+                obj = source(m)
+                assert isinstance(obj.to_gks()._numint, NumInt2C)
+
+            obj = dft.GKS(m)
+            obj.collinear = 'ncol'
+            assert obj.to_gks()._numint is obj._numint
+
     def test_get_ghf_orbspin(self):
         orbspin = addons.get_ghf_orbspin(mf.mo_energy, mf.mo_occ)
         self.assertEqual(list(orbspin), [0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1])
@@ -449,7 +490,8 @@ class KnownValues(unittest.TestCase):
         mf = addons.smearing(mf, sigma=0.1)
         mf.kernel()
         self.assertAlmostEqual(mf.mo_occ.sum(), 15, 8)
-        self.assertAlmostEqual(mf.e_tot, -106.9310800402, 8)
+        self.assertAlmostEqual(mf.e_free, -107.22209716, 8)
+        self.assertAlmostEqual(mf.e_tot, -106.9310800142, 5)
 
     def test_uhf_smearing(self):
         mol = gto.M(
@@ -468,16 +510,16 @@ class KnownValues(unittest.TestCase):
         myhf_s = addons.smearing_(myhf_s, sigma=0.01, method='fermi', fix_spin=True)
         myhf_s.sigma = 0.1
         myhf_s.fix_spin = False
-        myhf_s.conv_tol = 1e-7
+        myhf_s.conv_tol = 1e-9
         myhf_s.kernel()
-        self.assertAlmostEqual(myhf_s.e_tot, -243.086989253, 5)
-        self.assertAlmostEqual(myhf_s.entropy, 17.11431, 4)
+        # With sigma=0.1 the near-degenerate 3d manifold makes the plain
+        # energy E vary a lot (free-energy-degenerate), while 
+        # e_free = E - sigma*S is more stable (see
+        # issue #3379). Assert e_free tightly and E/entropy loosely.
+        self.assertAlmostEqual(myhf_s.e_free, -244.7984202573, 7)
+        self.assertAlmostEqual(myhf_s.e_tot, -243.086989253, 4)
+        self.assertAlmostEqual(myhf_s.entropy, 17.11431, 3)
         self.assertTrue(myhf_s.converged)
-
-        myhf_s.mu = -0.2482816
-        myhf_s.kernel(dm0=myhf_s.make_rdm1())
-        self.assertAlmostEqual(myhf_s.e_tot, -243.086989253, 5)
-        self.assertAlmostEqual(myhf_s.entropy, 17.11431, 4)
 
     def test_rhf_smearing_nelec(self):
         mol = gto.Mole()

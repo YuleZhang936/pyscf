@@ -14,9 +14,9 @@
 # limitations under the License.
 
 import unittest
-import tempfile
 from functools import reduce
 import numpy
+import numpy as np
 from pyscf import lib
 from pyscf import gto
 from pyscf import scf
@@ -69,6 +69,14 @@ class KnownValues(unittest.TestCase):
         mmp.kernel()
         self.assertAlmostEqual(mmp.e_corr, -0.09397152054462676, 8)
 
+        mmp = mp.dfump2.DFUMP2(mf, frozen=0)
+        mmp.kernel()
+        self.assertAlmostEqual(mmp.e_corr, -0.15321910903780495, 8)
+
+        mmp = mp.dfump2.DFUMP2(mf, frozen=np.array([0]))
+        mmp.kernel()
+        self.assertAlmostEqual(mmp.e_corr, -0.15103334394544674, 8)
+
     def test_dfmp2_mf_with_df(self):
         mmpref = mp.ump2.UMP2(dfmf)
         mmpref.kernel()
@@ -97,7 +105,7 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(mmp.e_corr, mmp1.e_corr, 8)
 
     def test_read_ovL_outcore(self):
-        ftmp = tempfile.NamedTemporaryFile()
+        ftmp = lib.NamedTemporaryFile()
 
         mmp = mp.dfump2.DFUMP2(mf)
         eris = mmp.ao2mo(ovL_to_save=ftmp.name)
@@ -154,6 +162,43 @@ class KnownValues(unittest.TestCase):
         mmp.kernel()
         self.assertAlmostEqual(mmp.e_corr, eref, 8)
 
+
+    def test_dfump2_non_canonical(self):
+        # Non-canonical reference: converged UHF orbitals rotated between the
+        # occupied and virtual spaces, so that the occupied-virtual Fock block
+        # is nonzero and the first-order singles (T1) contribute (issue #1687).
+        # The same (identical) orbitals are used for the DF and 4-center
+        # calculations, so the results agree within the fitting error.
+        mol1 = gto.M(atom='O 0 0 0; O 0 0 1.2222', spin=2, basis='sto-3g',
+                     verbose=0)
+        mf1 = scf.UHF(mol1).run()
+        nocca = numpy.count_nonzero(mf1.mo_occ[0] > 0)
+        noccb = numpy.count_nonzero(mf1.mo_occ[1] > 0)
+        ct, st = numpy.cos(0.4), numpy.sin(0.4)
+        c = [x.copy() for x in mf1.mo_coeff]
+        for s, nocc in [(0, nocca), (1, noccb)]:
+            cocc, cvir = c[s][:,nocc-1].copy(), c[s][:,nocc].copy()
+            c[s][:,nocc-1], c[s][:,nocc] = ct*cocc + st*cvir, -st*cocc + ct*cvir
+
+        mfr = scf.UHF(mol1)
+        mfr.__dict__.update(mf1.__dict__)
+        mfr.mo_coeff = c
+        mfr.converged = False
+        pt = mp.UMP2(mfr).run(conv_tol=1e-10)
+
+        mfd = scf.UHF(mol1).density_fit()
+        mfd.__dict__.update(mf1.__dict__)
+        mfd.mo_coeff = c
+        mfd.converged = False
+        mmp = mp.dfump2.DFUMP2(mfd)
+        mmp.conv_tol = 1e-10
+        mmp.kernel()
+        self.assertTrue(mmp.converged)
+        self.assertAlmostEqual(abs(mmp.e_corr - pt.e_corr), 0, 4)
+        # t1 depends only on the Fock matrix, hence identical for DF and 4c
+        self.assertAlmostEqual(max(abs(x - y).max() for x, y in
+                                   zip(mmp.t1, pt.t1)), 0, 4)
+        self.assertAlmostEqual(mmp.e_corr_singles, pt.e_corr_singles, 4)
 
 if __name__ == "__main__":
     print("Full Tests for dfump2")

@@ -166,21 +166,21 @@ def _adjust_planar_d2h(atom_coords, axes):
     natm_with_y = numpy.count_nonzero(abs(atom_coords.dot(axes[1])) > tol)
     natm_with_z = numpy.count_nonzero(abs(atom_coords.dot(axes[2])) > tol)
     if natm_with_z == 0:  # atoms on xy plane
-        if natm_with_x >= natm_with_y:  # atoms-on-y >= atoms-on-x
+        if natm_with_x >= natm_with_y:
             # rotate xz
             axes = numpy.array([-axes[2], axes[1], axes[0]])
         else:
             # rotate xy then rotate xz
             axes = numpy.array([axes[2], axes[0], axes[1]])
     elif natm_with_y == 0:  # atoms on xz plane
-        if natm_with_x >= natm_with_z:  # atoms-on-z >= atoms-on-x
+        if natm_with_x < natm_with_z:
             # rotate xy
             axes = numpy.array([-axes[1], axes[0], axes[2]])
         else:
             # rotate xz then rotate xy
             axes = numpy.array([axes[1], axes[2], axes[0]])
     elif natm_with_x == 0:  # atoms on yz plane
-        if natm_with_y < natm_with_z:  # atoms-on-z < atoms-on-y
+        if natm_with_y > natm_with_z:
             # rotate yz
             axes = numpy.array([axes[0], -axes[2], axes[1]])
     return axes
@@ -311,7 +311,7 @@ def detect_symm(atoms, basis=None, verbose=logger.WARN):
                     axes = _adjust_planar_d2h(rawsys.atom_coords, axes)
                 else:
                     gpname = 'D2'
-                axes = alias_axes(axes, numpy.eye(3))
+                    axes = alias_axes(axes, numpy.eye(3))
             elif is_c2z or is_c2x or is_c2y:
                 if is_c2x:
                     axes = axes[[1,2,0]]
@@ -669,7 +669,7 @@ class SymmSys:
             r0 = self.atoms[lst,1:]
             r1 = numpy.dot(r0, op)
             # FIXME: compare whether two sets of coordinates are identical
-            yield all((_vec_in_vecs(x, r0) for x in r1))
+            yield all(_vec_in_vecs(x, r0) for x in r1)
 
     def has_icenter(self):
         return all(self.symmetric_for(-1))
@@ -735,8 +735,8 @@ class SymmSys:
                 seen[where1] = True
                 seen[where2] = True
 
-                vk = _normalize((numpy.einsum('ix->x', vecs[where1]) -
-                                 numpy.einsum('ix->x', vecs[where2])))
+                vk = _normalize(numpy.einsum('ix->x', vecs[where1]) -
+                                 numpy.einsum('ix->x', vecs[where2]))
                 for n in (set(ns[where1]) | set(ns[where2])):
                     possible_cn.append((vk,n))
         return possible_cn

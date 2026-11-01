@@ -28,6 +28,7 @@ Ref:
 '''
 
 import os
+import sys
 import ctypes
 import warnings
 import tempfile
@@ -254,7 +255,12 @@ class _RSGDFBuilder(Int3cBuilder):
 
         if not self.has_long_range():
             omega = auxcell.omega
-            j2c = auxcell.pbc_intor('int2c2e', hermi=1, kpts=uniq_kpts)
+            rcut = estimate_rs_2c2e_rcut(auxcell, omega, auxcell.precision*1e-6)
+            try:
+                auxcell.rcut, rcut_backup = rcut, auxcell.rcut
+                j2c = auxcell.pbc_intor('int2c2e', hermi=1, kpts=uniq_kpts)
+            finally:
+                auxcell.rcut = rcut_backup
             if (auxcell.dimension >= 2 and omega != 0 and
                 auxcell.low_dim_ft_type != 'inf_vacuum'):
                 gamma_point_idx = member(np.zeros(3), uniq_kpts)
@@ -379,7 +385,8 @@ class _RSGDFBuilder(Int3cBuilder):
         # as cderi_file.
         fswap = lib.H5TmpFile(dir=os.path.dirname(cderi_file), prefix='.outcore_auxe2_swap')
         # Unlink swapfile to avoid trash files
-        os.unlink(fswap.filename)
+        if sys.platform != 'win32':
+            os.unlink(fswap.filename)
 
         log = logger.new_logger(self)
         cell = self.cell
@@ -1406,10 +1413,9 @@ def _round_off_to_odd_mesh(mesh):
     # Round off mesh to the nearest odd numbers.
     # Odd number of grids is preferred because even number of grids may break
     # the conjugation symmetry between the k-points k and -k.
-    # When building the DF integral tensor in function _make_j3c, the symmetry
-    # between k and -k is used (function conj_j2c) to overcome the error
-    # caused by auxiliary basis linear dependency. More details of this
-    # problem can be found in function _make_j3c.
+    # The DF builder uses this symmetry (_conj_j2c) to keep the decomposed
+    # Coulomb metrics at k and -k consistent when the auxiliary basis is
+    # linearly dependent.
     if isinstance(mesh, (int, np.integer)):
         return (mesh // 2) * 2 + 1
     else:
@@ -1622,10 +1628,20 @@ def estimate_omega_for_ke_cutoff(cell, ke_cutoff, precision=None):
 def estimate_rs_2c2e_rcut(auxcell, omega, precision=None):
     if precision is None:
         precision = auxcell.precision
-    aux_exp = np.hstack(auxcell.bas_exps()).min()
+    ak, ck, lk = gto.most_diffuse_pgto(auxcell)
     if omega == 0:
-        theta = aux_exp / 2
+        theta = ak / 2
     else:
-        theta = 1./(2./aux_exp + omega**-2)
-    fac = 2*np.pi**3.5/auxcell.vol * aux_exp**-3 * theta**-1.5
-    return (np.log(fac / auxcell.rcut / precision + 1.) / theta)**.5
+        theta = 1./(omega**-2 + 2./ak)
+    norm_ang = (2*lk+1)/(4*np.pi)
+    c1 = ck**2 * norm_ang
+    fl = 2
+    fac = np.pi**2.5*c1 * theta**(lk*2-.5)
+    vol = auxcell.vol
+    rad = vol**(-1./3) * auxcell.rcut + 1
+    surface = 4*np.pi * rad**2
+    lattice_sum_factor = 2*np.pi*auxcell.rcut/(vol*theta) + surface
+    fac *= lattice_sum_factor / ak**(lk*2+3) * fl / precision
+    rcut = auxcell.rcut
+    rcut = (np.log(fac * rcut**(lk*2-1) + 1.) / theta)**.5
+    return rcut
