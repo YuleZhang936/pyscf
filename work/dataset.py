@@ -1,8 +1,8 @@
 """Molecular inputs, lossless DCC-TZ density storage, and restartable ZIP shards.
 
-Each closed-shell label stores two signed symmetric float64 AO matrices:
-the aTZ MP2 base and the aDZ (CCSD - MP2) correction. The matrices keep their
-own basis definitions; real-space density is evaluated when requested.
+Each label stores an aTZ MP2 base and an aDZ (CCSD - MP2) correction.
+Unrestricted labels preserve alpha and beta separately in both bases;
+restricted labels store the spin sum. Real-space fields are evaluated on demand.
 """
 import bz2
 import ast
@@ -15,18 +15,20 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import tarfile
 import urllib.request
 import zipfile
 
 import numpy as np
 from pyscf import gto
-from pyscf.dcc_tz import density_diagnostics, evaluate_density
+from pyscf.dcc_tz import density_diagnostics, evaluate_density, evaluate_group
 
 INPUT = Path(__file__).resolve().parent/'data/small-density.zip'
 VALIDATION_ARCHIVE = Path(__file__).resolve().parent/'data/validation.zip'
 SOURCE_URL = 'https://qmml.org/Datasets/gdb9-14b.zip'
 SOURCE_SHA256 = '1261ac7dbeb0a899246f191c9467c23423111562c8fbe88b2f6ba6e6111a5e7a'
-FORMAT = 'dcc-tz-closed-shell-v1'
+FORMAT = 'dcc-tz-spin-v2'
+LEGACY_FORMAT = 'dcc-tz-closed-shell-v1'
 METHOD = 'DCC-TZ'
 
 def atomic_json(path, data):
@@ -51,15 +53,18 @@ def case_digest(case):
 
 
 
-def input_metadata(path=INPUT):
+def input_metadata(path=INPUT, subset='all'):
+    if subset not in ('all', 'closed-shell', 'open-shell'):
+        raise ValueError('Unknown input subset')
     with zipfile.ZipFile(path) as z:
-        return json.loads(z.read('dcc/metadata.json'))
+        member = 'dcc/metadata.json' if subset == 'all' else f'dcc/{subset}/metadata.json'
+        return json.loads(z.read(member))
 
 
 
-def input_cases(shard, path=INPUT):
+def input_cases(shard, path=INPUT, subset='all'):
+    meta = input_metadata(path, subset)
     with zipfile.ZipFile(path) as z:
-        meta = json.loads(z.read('dcc/metadata.json'))
         spec = meta['shards'][shard]
         raw = z.read(spec['member'])
         if hashlib.sha256(raw).hexdigest() != spec['sha256']:
@@ -82,14 +87,16 @@ def read_cases(manifest):
     return cases
 
 
-def prepare_input(path=INPUT):
+def prepare_input(path=INPUT, subset='all'):
     """Validate normalized shards, or normalize an original QM9 source archive."""
     path = Path(path)
     with zipfile.ZipFile(path) as z:
         if 'dcc/metadata.json' in z.namelist():
-            meta = input_metadata(path)
-            for i in range(len(meta['shards'])): input_cases(i, path)
+            meta = input_metadata(path, subset)
+            for i in range(len(meta['shards'])): input_cases(i, path, subset)
             return meta
+    if subset != 'all':
+        raise ValueError('Legacy QM9 input only supports the all subset')
     if digest(path) != SOURCE_SHA256:
         raise ValueError('Unexpected original QM9 archive checksum')
     with zipfile.ZipFile(path) as z:
@@ -231,26 +238,43 @@ def _basis_equal(a, b):
 
 def source_blocks(path):
     metadata, records = read_bundle(path)
-    if metadata['case'].get('spin', 0) != 0:
-        raise ValueError('This codec is for restricted closed-shell labels only')
     specs = [(c['coefficient'], c['role'], c['method']) for c in metadata['components']]
     if specs != [(1, 'T', 'mp2'), (1, 'A', 'ccsd'), (-1, 'A', 'mp2')]:
         raise ValueError('Expected the three frozen H3C components in order')
+    references = {r['meta'].get('reference') for _, r in records}
+    if references not in ({'RHF'}, {'UHF'}):
+        raise ValueError('Expected consistent RHF or UHF references')
+    unrestricted = references == {'UHF'}
+    if metadata['case'].get('spin', 0) and not unrestricted:
+        raise ValueError('A spin-polarized case requires alpha/beta densities')
     for _, r in records:
-        if r['meta'].get('reference') != 'RHF':
-            raise ValueError('Only restricted references can omit spin matrices')
-        if r.get('dm_spin') is None or not np.allclose(
-                r['dm_spin'], r['dm'][None]*0.5, rtol=0, atol=1e-12):
-            raise ValueError('Source does not contain equal alpha and beta densities')
+        spin_dm = r.get('dm_spin')
+        if spin_dm is None or spin_dm.shape != (2, *r['dm'].shape) or not np.allclose(
+                spin_dm.sum(axis=0), r['dm'], rtol=0, atol=1e-10):
+            raise ValueError('Invalid source alpha/beta matrices')
+        mol = gto.loads(r['meta']['mol'])
+        counts = np.einsum('sij,ji->s', spin_dm, mol.intor_symmetric('int1e_ovlp'))
+        if np.max(np.abs(counts-mol.nelec)) > 1e-7:
+            raise ValueError('Incorrect source spin electron counts')
+        if not unrestricted and not np.allclose(spin_dm, r['dm'][None]*.5, rtol=0, atol=1e-12):
+            raise ValueError('Restricted source has unequal alpha/beta densities')
     mols = [gto.loads(r['meta']['mol']) for _, r in records]
+    if any(m.charge != metadata['case'].get('charge', 0) or m.spin != metadata['case'].get('spin', 0)
+           or m._atom != mols[0]._atom for m in mols):
+        raise ValueError('Component geometry/charge/spin differs from the case')
     if not _basis_equal(mols[1], mols[2]):
         raise ValueError('aDZ subtraction requires identical AO definitions')
     if [r['meta']['basis'].lower() for _, r in records] != [
             'aug-cc-pvtz', 'aug-cc-pvdz', 'aug-cc-pvdz']:
         raise ValueError('Unexpected basis')
-    d = [r['dm'] for _, r in records]
-    blocks = [dict(name='base_aTZ', mol=mols[0], dm=_symmetric(d[0])),
-              dict(name='delta_aDZ', mol=mols[1], dm=_symmetric(d[1]-d[2]))]
+    d = [r['dm_spin'] if unrestricted else r['dm'] for _, r in records]
+    blocks = []
+    for name, mol, value in [('base_aTZ', mols[0], d[0]), ('delta_aDZ', mols[1], d[1]-d[2])]:
+        spin_dm = np.array([_symmetric(v) for v in value]) if unrestricted else None
+        total = spin_dm.sum(axis=0) if unrestricted else _symmetric(value)
+        blocks.append(dict(name=name, mol=mol, dm=total,
+                           dm_spin=spin_dm if unrestricted else np.array([total*.5, total*.5]),
+                           unrestricted=unrestricted))
     return metadata, blocks
 
 
@@ -260,26 +284,39 @@ def decode_block(spec, arrays, mol):
     if spec['codec'] != 'packed64':
         raise ValueError('Only the production packed64 codec is supported')
     n = mol.nao_nr()
+    if spec.get('nao') != n:
+        raise ValueError('Packed AO count differs from the stored basis')
     triangle = np.asarray(arrays['triangle'])
-    if (triangle.dtype != np.float64 or triangle.shape != (n*(n+1)//2,)
+    channels = spec.get('spin_channels', ['total'])
+    if channels not in (['total'], ['alpha', 'beta']):
+        raise ValueError('Unsupported spin channels')
+    shape = (n*(n+1)//2,) if channels == ['total'] else (2, n*(n+1)//2)
+    if (triangle.dtype != np.float64 or triangle.shape != shape
             or not np.isfinite(triangle).all()):
         raise ValueError('Invalid packed AO matrix')
-    dm = np.zeros((n,n))
+    dm = np.zeros((n,n) if channels == ['total'] else (2,n,n))
     i, j = np.tril_indices(n)
-    dm[i,j] = dm[j,i] = triangle
+    dm[...,i,j] = dm[...,j,i] = triangle
     return dm
 
 
 def encode_block(dm, mol, mode='packed64', tolerance=5e-7):
     if mode != 'packed64':
         raise ValueError('Production uses lossless packed64')
-    dm = _symmetric(dm)
-    arrays = dict(triangle=dm[np.tril_indices(len(dm))].copy())
-    spec = dict(codec='packed64', requested_codec=mode, nao=len(dm))
+    dm = np.asarray(dm)
+    unrestricted = dm.ndim == 3 and dm.shape[0] == 2
+    dm = np.array([_symmetric(v) for v in dm]) if unrestricted else _symmetric(dm)
+    n = mol.nao_nr()
+    if dm.shape[-2:] != (n,n):
+        raise ValueError('Density dimensions differ from its AO basis')
+    i, j = np.tril_indices(n)
+    arrays = dict(triangle=dm[...,i,j].copy())
+    spec = dict(codec='packed64', requested_codec=mode, nao=n,
+                spin_channels=['alpha', 'beta'] if unrestricted else ['total'])
     restored = decode_block(spec, arrays, mol)
     if not np.array_equal(dm, restored):
         raise ValueError('Packed64 roundtrip changed the density')
-    count = float(np.einsum('ij,ji', dm, mol.intor_symmetric('int1e_ovlp')))
+    count = np.einsum('...ij,ji->...', dm, mol.intor_symmetric('int1e_ovlp')).tolist()
     # Exact packing requires no overlap inversion, even for redundant AO bases.
     spec.update(l1_bound_electrons=0., electron_count_before=count,
                 electron_count_after=count, array_bytes=arrays['triangle'].nbytes)
@@ -293,7 +330,8 @@ def write_compact(source, output, mode='packed64', tolerance=1e-6):
     metadata, blocks = source_blocks(source)
     arrays, specs = {}, []
     for i, block in enumerate(blocks):
-        spec, data = encode_block(block['dm'], block['mol'], mode, tolerance/2)
+        spec, data = encode_block(block['dm_spin'] if block['unrestricted'] else block['dm'],
+                                  block['mol'], mode, tolerance/2)
         spec.update(name=block['name'], mol=block['mol'].dumps(),
                     arrays={k: f'block_{i}_{k}' for k in data})
         specs.append(spec)
@@ -303,7 +341,7 @@ def write_compact(source, output, mode='packed64', tolerance=1e-6):
                 source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
                 source_metadata=metadata, blocks=specs,
                 coordinate_unit='Bohr', density_unit='electron/Bohr^3',
-                spin_representation='restricted: alpha=beta=total/2',
+                spin_representation='unrestricted: alpha,beta' if blocks[0]['unrestricted'] else 'restricted: alpha=beta=total/2',
                 requested_l1_bound_electrons=tolerance,
                 l1_bound_electrons=sum(s['l1_bound_electrons'] for s in specs),
                 bound_note='Analytical L1 inequality, evaluated numerically in float64; no certified floating-point rounding bound.')
@@ -327,13 +365,28 @@ def write_compact(source, output, mode='packed64', tolerance=1e-6):
 def read_compact(path):
     with np.load(path, allow_pickle=False) as data:
         metadata = json.loads(str(data['metadata']))
-        if metadata.get('format') != FORMAT:
+        if metadata.get('format') not in (FORMAT, LEGACY_FORMAT):
             raise ValueError('Unsupported compact density format')
+        if len(metadata['blocks']) != 2:
+            raise ValueError('Expected base and correction AO blocks')
         records = []
         for spec in metadata['blocks']:
             mol = gto.loads(spec['mol'])
-            dm = decode_block(spec, {k: data[v] for k, v in spec['arrays'].items()}, mol)
-            records.append(dict(meta=dict(mol=spec['mol']), dm=dm, dm_spin=np.array([dm/2, dm/2])))
+            case = metadata['source_metadata']['case']
+            if mol.charge != case.get('charge', 0) or mol.spin != case.get('spin', 0):
+                raise ValueError('Stored basis has the wrong charge/spin')
+            value = decode_block(spec, {k: data[v] for k, v in spec['arrays'].items()}, mol)
+            spin_dm = value if value.ndim == 3 else np.array([value*.5, value*.5])
+            dm = value.sum(axis=0) if value.ndim == 3 else value
+            records.append(dict(meta=dict(mol=spec['mol']), dm=dm, dm_spin=spin_dm))
+        channels = [b.get('spin_channels', ['total']) for b in metadata['blocks']]
+        if channels[0] != channels[1]:
+            raise ValueError('Inconsistent spin channels between basis blocks')
+        polarized = metadata['source_metadata']['case'].get('spin', 0) != 0
+        if polarized and channels[0] != ['alpha', 'beta']:
+            raise ValueError('Spin-polarized label lost its alpha/beta channels')
+        if metadata['spin_representation'].startswith('unrestricted') != (channels[0] == ['alpha', 'beta']):
+            raise ValueError('Spin representation disagrees with stored matrices')
     return metadata, records
 
 
@@ -343,27 +396,28 @@ def evaluate_compact(path, coords, spin=False):
     if coords.ndim != 2 or coords.shape[1] != 3 or not np.isfinite(coords).all():
         raise ValueError('Expected finite (n,3) coordinates in Bohr')
     _, records = read_compact(path)
-    rho = sum(evaluate_density(r, coords) for r in records)
-    return np.array([rho/2, rho/2]) if spin else rho
+    if spin:
+        return sum(evaluate_group({'block': r}, coords, spin=True)['block'] for r in records)
+    return sum(evaluate_density(r, coords) for r in records)
 
 
 
 def label_entry(path, case, run_id):
     """Validate provenance before admitting a computed density to a shard."""
     import numpy as np
-    with np.load(path,allow_pickle=False) as label:
-        meta=json.loads(str(label['metadata']))
-        if meta.get('format')!='dcc-tz-closed-shell-v1': raise ValueError('Wrong density format')
-        source=meta['source_metadata']
-        if source['case']!=case: raise ValueError('Density geometry/state mismatch')
-        if not source['validation'].get('quality_pass'): raise ValueError('Unvalidated numerical label')
-        if source['validation'].get('production_run_id')!=run_id: raise ValueError('Density run identity mismatch')
-        if any(b['codec']!='packed64' for b in meta['blocks']): raise ValueError('Production requires packed64')
-        if len(meta['blocks'])!=2: raise ValueError('Expected two AO blocks')
-        for b in meta['blocks']:
-            a=label[b['arrays']['triangle']]
-            if a.dtype!=np.float64 or a.shape!=(b['nao']*(b['nao']+1)//2,) or not np.isfinite(a).all():
-                raise ValueError('Invalid packed density')
+    meta, records = read_compact(path)
+    source=meta['source_metadata']
+    if source['case']!=case: raise ValueError('Density geometry/state mismatch')
+    if not source['validation'].get('quality_pass'): raise ValueError('Unvalidated numerical label')
+    if source['validation'].get('production_run_id')!=run_id: raise ValueError('Density run identity mismatch')
+    if case.get('spin', 0) and not source['validation'].get('spin_quality_pass'):
+        raise ValueError('Missing independent alpha/beta numerical validation')
+    for i, r in enumerate(records):
+        mol = gto.loads(r['meta']['mol'])
+        counts = np.einsum('sij,ji->s', r['dm_spin'], mol.intor_symmetric('int1e_ovlp'))
+        expected = mol.nelec if i == 0 else (0, 0)
+        if np.max(np.abs(counts-expected)) > 1e-7:
+            raise ValueError('Packed density has incorrect spin electron counts')
     return dict(member=case['name']+'.npz',sha256=digest(path),bytes=Path(path).stat().st_size,
                 case_sha256=case_digest(case))
 
@@ -650,6 +704,31 @@ NCI_SOURCES = {
 }
 
 
+def _gmtkn_open_sources(raw):
+    """Retain unmodified XYZ/state/bibliography files from the pinned tarball."""
+    expected = 'ee134a03a7c146931f10988965dad52a4d6bdde1d9f1fed5281934b0d7b7dfd1'
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError('GMTKN55 upstream tarball checksum mismatch')
+    members = {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode='r:gz') as archive:
+        for item in archive.getmembers():
+            parts = item.name.split('/')[1:]
+            if not item.isfile() or not parts:
+                continue
+            if parts == ['LICENSE'] or (parts[0] in ('W4-11', 'G21EA', 'G21IP') and (
+                    (len(parts) == 3 and parts[-1] in ('struc.xyz', '.CHRG', '.UHF')) or
+                    (len(parts) == 2 and parts[-1] in ('.bib', '.res')))):
+                members['/'.join(parts)] = archive.extractfile(item).read()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as z:
+        for name, contents in sorted(members.items()):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            z.writestr(info, contents, compresslevel=6)
+    return buffer.getvalue()
+
+
 def _small_sources(directory, previous, base):
     """Read pinned bytes locally, from a previous output, or from public URLs."""
     nci_root = f'https://raw.githubusercontent.com/Honza-R/NCIAtlas/{NCIA_REVISION}'
@@ -657,6 +736,10 @@ def _small_sources(directory, previous, base):
     specs = {name+'.zip': (f'{nci_root}/packaged_sets/NCIA_{name}_github_package.zip', sha)
              for name, (sha, _) in NCI_SOURCES.items()}
     specs.update({
+        'O24by5.py': (f'{psi_root}/psi4/share/psi4/databases/O24by5.py',
+                      'd2d05b5775d49b21c0ee9c2276ce7c0d11690c0c5a34233a4155c88424de3b61'),
+        'GMTKN55-open.zip': (f'https://codeload.github.com/grimme-lab/GMTKN55/tar.gz/{GMTKN55_REVISION}',
+                             '6428df432915a795c01993e5b7369142752eba2de33cf096e4f26678773fd752'),
         'A24.py': (f'{psi_root}/psi4/share/psi4/databases/A24.py',
                    '1cac58beca09b348e5f129e80accfea2ea6dd28a14f8cebedb41ee5ce292f757'),
         'README.md': (f'{nci_root}/README.md',
@@ -676,17 +759,23 @@ def _small_sources(directory, previous, base):
             embedded = {Path(n).name: z.read(n) for n in z.namelist() if n.startswith('sources/')}
     contents, provenance = {}, {}
     for filename, (url, sha) in specs.items():
-        if directory is not None:
+        if directory is not None and (Path(directory)/filename).exists():
             raw = (Path(directory)/filename).read_bytes()
         elif filename in embedded:
             raw = embedded[filename]
         else:
             with urllib.request.urlopen(url, timeout=90) as response:
                 raw = response.read()
+            if filename == 'GMTKN55-open.zip':
+                raw = _gmtkn_open_sources(raw)
         if hashlib.sha256(raw).hexdigest() != sha:
             raise ValueError(f'Source checksum mismatch: {filename}')
         contents[filename] = raw
         provenance[filename] = dict(url=url, sha256=sha, bytes=len(raw))
+        if filename == 'GMTKN55-open.zip':
+            provenance[filename].update(upstream_tarball_sha256=
+                'ee134a03a7c146931f10988965dad52a4d6bdde1d9f1fed5281934b0d7b7dfd1',
+                transformation='Select W4-11/G21EA/G21IP XYZ, .CHRG, .UHF, .bib, .res and root LICENSE; deterministic ZIP, file contents unchanged.')
     raw = Path(base).read_bytes() if Path(base).exists() else embedded['ixc2-small.zip']
     sha = '41c12d3c7c3fcffa76ac6d4c0d61add6ba99961e71fb1eaa5189dba1de9f1892'
     if hashlib.sha256(raw).hexdigest() != sha:
@@ -790,6 +879,95 @@ def _a24_cases(raw):
     return cases
 
 
+def _o24_cases(raw):
+    """Read published no-midbond geometries and use the high-spin coupling."""
+    descriptions = {int(m[1]): (m[2].strip(), m[3]) for line in raw.decode().splitlines()
+                    if (m := re.match(r'^\|\s*(\d+)\s*\|\s*(.*?)\s*\|\s*(DD|ED|MX)\s*$', line))}
+    geometries, energies = {}, {}
+    for node in ast.parse(raw.decode()).body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Subscript) or not isinstance(target.value, ast.Name):
+            continue
+        if target.value.id not in ('GEOS', 'BIND'):
+            continue
+        key = ast.literal_eval(target.slice.right.elts[1])
+        if target.value.id == 'GEOS':
+            geometries[key] = ast.literal_eval(node.value.args[0])
+        else:
+            # Original literal BIND values are in cm^-1. Ignore the later
+            # executable loop that converts units in the Psi4 module.
+            energies[key] = ast.literal_eval(node.value)
+    expected = {f'{i}-{r}' for i in range(1, 25) for r in ('0.9','1.0','1.2','1.5','2.0')}
+    if set(geometries) != expected or set(energies) != expected or len(descriptions) != 24:
+        raise ValueError('Incomplete O24x5 source')
+    curves = defaultdict(list)
+    for key, text in sorted(geometries.items()):
+        ident, scaling = key.split('-')
+        if 'units angstrom' not in text.lower():
+            raise ValueError('Unexpected O24 coordinate unit')
+        atoms, fragments = [], []
+        for fragment in text.lower().replace('units angstrom', '').split('--'):
+            rows = [line.split() for line in fragment.splitlines() if line.strip()]
+            charge, mult = map(int, rows[0])
+            start = len(atoms)
+            atoms.extend([[r[0].capitalize(), list(map(float, r[1:]))] for r in rows[1:]])
+            fragments.append(dict(indices=list(range(start, len(atoms))), charge=charge, spin=mult-1))
+        if len(fragments) != 2:
+            raise ValueError('Expected two physical fragments without midbond centers')
+        description, group = descriptions[int(ident)]
+        curves[ident].append(dict(name='o24_'+key.replace('.', 'p'), atom=atoms, unit='Angstrom',
+            charge=sum(f['charge'] for f in fragments), spin=sum(f['spin'] for f in fragments),
+            fragments=fragments, source='O24x5', source_member=f'O24by5.py:GEOS[{key}]',
+            description=description, family='O24x5/'+ident, role='dimer', group=group,
+            scaling=float(scaling), spin_coupling='high-spin S_total=S_A+S_B; no broken-symmetry singlet',
+            source_energy=dict(value=energies[key], unit='cm^-1',
+                               kind='published interaction energy, not a density label')))
+    return curves
+
+
+def _gmtkn_open_cases(raw):
+    """Read explicit GMTKN55 spin states; absent .UHF denotes zero unpaired electrons."""
+    cases = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        names = set(z.namelist())
+        for member in sorted(names):
+            if not member.endswith('/struc.xyz'):
+                continue
+            prefix = member.rsplit('/', 1)[0]
+            spin = int(z.read(prefix+'/.UHF')) if prefix+'/.UHF' in names else 0
+            if spin <= 0:
+                continue
+            if prefix+'/.CHRG' not in names:
+                raise ValueError(f'Missing GMTKN55 charge: {prefix}')
+            charge = int(z.read(prefix+'/.CHRG'))
+            lines = z.read(member).decode().splitlines()
+            atoms = [[r[0].capitalize(), list(map(float, r[1:]))]
+                     for line in lines[2:] if (r := line.split())]
+            if len(atoms) != int(lines[0]):
+                raise ValueError('Truncated GMTKN55 XYZ')
+            cases.append(dict(name='gmtkn55_'+prefix.replace('/', '_'), atom=atoms,
+                unit='Angstrom', charge=charge, spin=spin, source='GMTKN55/'+prefix.split('/')[0],
+                source_member='GMTKN55-open.zip::'+member, role='isolated_open_shell',
+                family=prefix, spin_source=prefix+'/.UHF'))
+    return cases
+
+
+def _fragment_distance_drift(points, reference):
+    """Measure source rounding/internal relaxation without merging geometries."""
+    maximum = 0.
+    for fragment in reference['fragments']:
+        indices = fragment['indices']
+        xyz = np.array([reference['atom'][i][1] for i in indices])
+        distances = np.linalg.norm(xyz[:, None]-xyz[None, :], axis=2)
+        for point in points:
+            xyz = np.array([point['atom'][i][1] for i in indices])
+            maximum = max(maximum, float(np.max(np.abs(
+                np.linalg.norm(xyz[:, None]-xyz[None, :], axis=2)-distances))))
+    return maximum
+
+
 def prepare_small(output=INPUT, sources=None, base=None):
     """Build an offline, provenance-complete small-molecule input archive.
 
@@ -809,11 +987,11 @@ def prepare_small(output=INPUT, sources=None, base=None):
         xyz = np.asarray([a[1] for a in case['atom']], dtype=float)
         if not symbols or not set(symbols) <= set(elements) or xyz.shape != (len(symbols), 3) or not np.isfinite(xyz).all():
             raise ValueError(f'Invalid atom data: {case["name"]}')
-        if case['unit'] != 'Angstrom' or case['spin'] != 0:
-            raise ValueError('Production pool must be singlet and in Angstrom')
+        if case['unit'] != 'Angstrom' or not isinstance(case['spin'], int) or case['spin'] < 0:
+            raise ValueError('Invalid unit or spin (N_alpha-N_beta)')
         nelec = sum(gto.charge(e) for e in symbols)-case['charge']
-        if nelec <= 0 or nelec % 2:
-            raise ValueError(f'Invalid singlet electron count: {case["name"]}')
+        if nelec <= 0 or nelec < case['spin'] or (nelec-case['spin']) % 2:
+            raise ValueError(f'Inconsistent charge and spin: {case["name"]}')
         if len(symbols) > 1:
             distances = np.linalg.norm(xyz[:, None]-xyz[None, :], axis=2)
             if distances[np.triu_indices(len(symbols), 1)].min() < .2:
@@ -831,6 +1009,10 @@ def prepare_small(output=INPUT, sources=None, base=None):
         if size(case) != case['size'] or case['shared_with_heldout']:
             raise ValueError('Invalid reviewed IXC2 case')
     base_count = len(cases)
+    base_open_count = len(open_cases)
+    for case in open_cases:
+        if size(case) != case['size'] or case['shared_with_heldout']:
+            raise ValueError('Invalid reviewed IXC2 open-shell case')
     audit, selected_curves, dimers, monomers = {}, [], [], []
     for name in NCI_SOURCES:
         curves = _nci_curves(raw_sources[name+'.zip'], name)
@@ -871,17 +1053,7 @@ def prepare_small(output=INPUT, sources=None, base=None):
         for key in sorted(selected):
             reference = candidates[key]
             points = sorted(curves[key], key=lambda p: p['scaling'])
-            # Report internal-distance changes rather than silently merging
-            # approximately equal fragment geometries from different points.
-            max_change = 0.
-            for fragment in reference['fragments']:
-                idx = fragment['indices']
-                coords = np.array([reference['atom'][i][1] for i in idx])
-                ref_dist = np.linalg.norm(coords[:, None]-coords[None, :], axis=2)
-                for p in points:
-                    xyz = np.array([p['atom'][i][1] for i in idx])
-                    max_change = max(max_change, float(np.max(np.abs(
-                        np.linalg.norm(xyz[:, None]-xyz[None, :], axis=2)-ref_dist))))
+            max_change = _fragment_distance_drift(points, reference)
             selected_curves.append(dict(family=reference['family'], description=reference['description'],
                 category=category(reference), nao_tz=reference['size']['nao_tz'],
                 dimer_names=[p['name'] for p in points],
@@ -920,6 +1092,40 @@ def prepare_small(output=INPUT, sources=None, base=None):
                            kind='published interaction energy, not a density label'))
     ion_case['size'] = size(ion_case)
     dimers.append(ion_case)
+    # Keep each O24 curve complete. The frozen-core protocol is unchanged;
+    # exclude states with an empty active beta space rather than silently
+    # switching their core convention or preparing an excited-atom density.
+    o24_excluded = {}
+    o24_selected = []
+    for ident, points in sorted(_o24_cases(raw_sources['O24by5.py']).items(), key=lambda kv: int(kv[0])):
+        if ident == '23':
+            o24_excluded[ident] = 'Metastable He* pair with no beta electrons; outside this molecular production scope'
+            continue
+        for p in points:
+            p['size'] = size(p)
+        reference = next(p for p in points if p['scaling'] == 1.)
+        nelec = sum(gto.charge(a[0]) for a in reference['atom'])-reference['charge']
+        core = sum(0 if (q := gto.charge(a[0])) <= 2 else 1 if q <= 10 else 5 for a in reference['atom'])
+        if (nelec-reference['spin'])//2 <= core:
+            o24_excluded[ident] = 'Frozen core removes all active beta occupied orbitals (Na-Li high-spin pair)'
+            continue
+        if max(p['size']['nao_tz'] for p in points) > 400:
+            o24_excluded[ident] = 'Exceeds the 400 AO small-complex budget'
+            continue
+        o24_selected.append(ident)
+        selected_curves.append(dict(family=reference['family'], description=reference['description'],
+            category=reference['group'], nao_tz=reference['size']['nao_tz'],
+            dimer_names=[p['name'] for p in sorted(points, key=lambda p:p['scaling'])],
+                monomer_internal_distance_max_change_angstrom=_fragment_distance_drift(points, reference),
+            spin=reference['spin'], spin_coupling=reference['spin_coupling']))
+        dimers.extend(points)
+    isolated_open = []
+    for case in _gmtkn_open_cases(raw_sources['GMTKN55-open.zip']):
+        if len(case['atom']) <= 1 or not {a[0] for a in case['atom']} <= set(elements):
+            continue
+        case['size'] = size(case)
+        if case['size']['heavy'] <= 3 and case['size']['nao_tz'] <= 200:
+            isolated_open.append(case)
     for case in dimers:
         if case['scaling'] != 1.:
             continue
@@ -931,7 +1137,7 @@ def prepare_small(output=INPUT, sources=None, base=None):
                 parent=case['name'], fragment=label, group=case['group'])
             mono['size'] = size(mono)
             (monomers if len(mono['atom']) > 1 else atoms).append(mono)
-    cases.extend(dimers+monomers)
+    cases.extend(open_cases+isolated_open+dimers+monomers)
     # Exact Cartesian/charge/spin identity only. No approximate, rotational or
     # permutation merging: all published input geometries remain recoverable.
     unique, identities, aliases = [], {}, {}
@@ -945,6 +1151,14 @@ def prepare_small(output=INPUT, sources=None, base=None):
     cases = unique
     if len({c['name'] for c in cases}) != len(cases):
         raise ValueError('Duplicate production case name')
+    # Match the solver's existing frozen-core domain before a job is queued.
+    for case in cases:
+        nelec = sum(gto.charge(a[0]) for a in case['atom'])-case['charge']
+        core = sum(0 if (q := gto.charge(a[0])) <= 2 else 1 if q <= 10 else 5 for a in case['atom'])
+        if (nelec-case['spin'])//2 <= core:
+            raise ValueError(f'Empty active beta occupied space: {case["name"]}')
+    open_cases = [c for c in cases if c['spin'] != 0]
+    closed_cases = [c for c in cases if c['spin'] == 0]
 
     # Explicitly derived covalent scans are a separate research challenge.
     challenge = []
@@ -965,14 +1179,24 @@ def prepare_small(output=INPUT, sources=None, base=None):
                 note='Singlet branch only; dissociation can be multireference. H3C accuracy unverified.'))
     for case in challenge:
         size(case)
-    report = dict(format='dcc-small-selection-v1', density_labels_computed=False,
+    report = dict(format='dcc-small-selection-v2', density_labels_computed=False,
         production_count=len(cases), base_ixc2_count=base_count, added_source_dimers=len(dimers),
+        base_ixc2_open_count=base_open_count, added_isolated_open_records=len(isolated_open),
+        closed_shell_count=len(closed_cases), open_shell_count=len(open_cases),
+        open_shell_by_source=dict(Counter(c['source'] for c in open_cases)),
+        open_shell_multiplicity_counts=dict(Counter(str(c['spin']+1) for c in open_cases)),
+        open_shell_charge_counts=dict(Counter(str(c['charge']) for c in open_cases)),
+        open_shell_max_nao_tz=max(c['size']['nao_tz'] for c in open_cases),
         added_source_monomers=len(monomers), exact_duplicates_removed=len(aliases),
         atomic_reference_records=len(atoms), open_shell_candidates=len(open_cases),
         derived_bond_challenge=len(challenge), sources=provenance, nci_selection=audit,
         a24=dict(dimers=len(a24), groups=dict(Counter(c['group'] for c in a24))),
         il16=dict(source_dimers=16, selected=['227'], nao_tz_by_system=il_sizes,
                   rule='One ion-pair representative within the <=400 AO exception budget'),
+        o24=dict(source_curves=24, selected_curves=o24_selected, excluded_curves=o24_excluded,
+                 selected_dimers=5*len(o24_selected),
+                 coverage=dict(Counter(c['group'] for c in dimers if c['source']=='O24x5' and c['scaling']==1.)),
+                 above_300=[c['family'] for c in dimers if c['source']=='O24x5' and c['scaling']==1. and c['size']['nao_tz']>300]),
         charge_counts=dict(Counter(str(c['charge']) for c in cases)),
         source_counts=dict(Counter(c['source'] for c in cases)),
         nao_tz=dict(max=max(c['size']['nao_tz'] for c in cases),
@@ -986,17 +1210,21 @@ def prepare_small(output=INPUT, sources=None, base=None):
             'R739: one cheapest <=300 curve per (group, contact); preserve all five points.',
             'A24: all 24 published geometries; <=400 AO, no generated NCI coordinates.',
             'IL16: smallest cation-anion complex (ethylammonium chloride), aTZ=372; others >400.',
+            'Open shells: IXC2 BSE49 candidates; W4-11/G21EA/G21IP non-atomic spin>0, <=3 heavy atoms, aTZ<=200.',
+            'O24x5: complete high-spin curves, aTZ<=400; exclude He* and empty active beta space. No midbond functions.',
             'New monomers: extract only at scaling=1.0, without ghosts or relaxation.',
             'Deduplication: exact Cartesian geometry, charge and spin; aliases retained.'],
         split_note='Production candidate pool, not an independent accuracy test. New sources have no train/test assignment. Keep related curves/monomers together when splitting; source overlap is possible.',
         limitations=['No density accuracy or cost certification from geometry screening.',
             'No aromatic stacking, transition metals, solvent ensembles or general reaction/TS coverage.',
-            'Bond-stretch challenge and open-shell inputs are excluded from default production shards.'],
+            'Bond-stretch challenge is excluded from production. Low-spin radical pairs and excited-state root tracking are not implemented.',
+            'High-spin O24 geometries are included, but their original ROCCSD(T) energy benchmarks do not certify UHF-based H3C density accuracy.'],
         base_selection=base_report['selected'], builder_sha256=digest(__file__))
     members = {'sources/'+n: raw for n, raw in raw_sources.items()}
     def add_json(name, value):
         members[name] = (json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)+'\n').encode()
     add_json('cases/production.json', cases)
+    add_json('cases/closed_shell.json', closed_cases)
     add_json('cases/open_shell.json', open_cases)
     add_json('cases/bond_stretch_challenge.json', challenge)
     add_json('cases/atomic_references.json', atoms)
@@ -1012,24 +1240,28 @@ def prepare_small(output=INPUT, sources=None, base=None):
         'Geometry source: unmodified Psi4 A24.py, LGPL-3.0, with COPYING and COPYING.LESSER.\n'
         'GMTKN55: Goerigk et al., https://doi.org/10.1039/C7CP04913G, CC BY 4.0.\n'
         'IL16: Lao, Schaffer, Jansen and Herbert, https://doi.org/10.1021/ct5010593; original files retained.\n'
+        'O24x5: Madajczyk et al., https://doi.org/10.1063/5.0043793; unmodified Psi4 O24by5.py (LGPL-3.0), without midbonds.\n'
+        'GMTKN55 W4-11/G21EA/G21IP: CC BY 4.0; subset citations and unmodified XYZ/charge/spin files in GMTKN55-open.zip.\n'
         'IXC2 constituents: sources/ixc2-small.zip contains the TAE25, BSE49 and D442 provenance/licenses.\n'
         'Changes: size selection, format conversion, fragment extraction, exact duplicate aliases.\n'
         'Derived diatomic scans are separately marked and excluded from production.\n'
     ).encode()
     # Round-robin AO-size distribution is a scheduling heuristic, not a runtime prediction.
-    shards = [[] for _ in range(min(64, len(cases)))]
-    for i, case in enumerate(sorted(cases, key=lambda c: (-c['size']['nao_tz'], c['name']))):
-        shards[i % len(shards)].append(case)
-    specs = []
-    for i, chunk in enumerate(shards):
-        chunk.sort(key=lambda c: (c['size']['nao_tz'], c['name']))
-        member = f'dcc/inputs/{i:04d}.jsonl'
-        raw = ('\n'.join(json.dumps(c, sort_keys=True, separators=(',', ':')) for c in chunk)+'\n').encode()
-        members[member] = raw
-        specs.append(dict(member=member, count=len(chunk), sha256=hashlib.sha256(raw).hexdigest()))
-    add_json('dcc/metadata.json', dict(format='dcc-small-input-v1', count=len(cases), shards=specs,
-        density_labels_included=False, selection_report='report.json',
-        scheduling='64 shards, AO-size round robin; one molecule per process/node, multiple molecules per job'))
+    for subset, pool in [('all', cases), ('closed-shell', closed_cases), ('open-shell', open_cases)]:
+        prefix = 'dcc' if subset == 'all' else 'dcc/'+subset
+        shards = [[] for _ in range(min(16 if subset=='open-shell' else 64, len(pool)))]
+        for i, case in enumerate(sorted(pool, key=lambda c: (-c['size']['nao_tz'], c['name']))):
+            shards[i % len(shards)].append(case)
+        specs = []
+        for i, chunk in enumerate(shards):
+            chunk.sort(key=lambda c: (c['size']['nao_tz'], c['name']))
+            member = f'{prefix}/inputs/{i:04d}.jsonl'
+            raw = ('\n'.join(json.dumps(c, sort_keys=True, separators=(',', ':')) for c in chunk)+'\n').encode()
+            members[member] = raw
+            specs.append(dict(member=member, count=len(chunk), sha256=hashlib.sha256(raw).hexdigest()))
+        add_json(prefix+'/metadata.json', dict(format='dcc-small-input-v2', subset=subset,
+            count=len(pool), shards=specs, density_labels_included=False, selection_report='report.json',
+            scheduling='AO-size round robin; one molecule per process/node, multiple molecules per job'))
     add_json('index.json', {n: hashlib.sha256(raw).hexdigest() for n, raw in members.items()})
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_name(output.name+f'.{os.getpid()}.tmp')

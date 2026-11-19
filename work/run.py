@@ -49,13 +49,14 @@ def load_config(root, verify=True):
 
 
 def prepare(args):
-    meta=prepare_input(args.input)
+    meta=prepare_input(args.input, args.subset)
     root=Path(args.root).resolve()
     if (root/'config.json').exists():
         cfg=load_config(root)
         if Path(cfg['input'])!=Path(args.input).resolve(): raise ValueError('Different input dataset')
+        if cfg.get('subset', 'all')!=args.subset: raise ValueError('Different input subset; use a new output directory')
     else:
-        cfg=dict(format='dcc-molecular-run-v3',input=str(Path(args.input).resolve()),
+        cfg=dict(format='dcc-molecular-run-v4',input=str(Path(args.input).resolve()),subset=args.subset,
                  input_sha256=digest(args.input),runtime=runtime_version(),
                  molecules=meta['count'],shards=len(meta['shards']),codec='packed64',
                  nodes_per_molecule=1,processes_per_molecule=1,threads=52,
@@ -86,7 +87,7 @@ def shard_state(root, shard, cfg, deep=False):
                 for e in index['entries'].values():
                     if hashlib.sha256(z.read(e['member'])).hexdigest()!=e['sha256']:
                         raise ValueError('Archive checksum mismatch')
-    cases=input_cases(shard,cfg['input'])
+    cases=input_cases(shard,cfg['input'],cfg.get('subset','all'))
     if deep:
         done=DensityShard(root,shard,cfg['run_id'],cases).completed()
     names={c['name'] for c in cases}
@@ -182,7 +183,7 @@ def molecule(args):
     from work.dataset import write_compact, read_compact, source_blocks
     import numpy as np
     cfg=load_config(args.root)
-    case=input_cases(args.shard,cfg['input'])[args.index]
+    case=input_cases(args.shard,cfg['input'],cfg.get('subset','all'))[args.index]
     lib.num_threads(int(os.environ.get('SLURM_CPUS_PER_TASK',str(cfg['threads']))))
     def progress(stage,event): print(now(),case['name'],stage,event,flush=True)
     with tempfile.TemporaryDirectory(prefix='density-',dir=os.environ['TMPDIR']) as tmp:
@@ -190,7 +191,8 @@ def molecule(args):
         with stage_reporting(progress): build_density(case,raw,cfg['solver_memory_mb'],cfg['run_id'])
         write_compact(raw,args.output,mode='packed64')
         _,original=source_blocks(raw); _,restored=read_compact(args.output)
-        if not all(np.array_equal(a['dm'],b['dm']) for a,b in zip(original,restored)):
+        if not all(np.array_equal(a['dm'],b['dm']) and np.array_equal(a['dm_spin'],b['dm_spin'])
+                   for a,b in zip(original,restored)):
             Path(args.output).unlink(missing_ok=True)
             raise ValueError('Packed64 roundtrip differs from the two original AO blocks')
 
@@ -200,7 +202,7 @@ def worker(args):
     if int(os.environ.get('SLURM_JOB_NUM_NODES','0'))!=1 or int(os.environ.get('SLURM_NTASKS','0'))!=1:
         raise RuntimeError('Worker requires one Slurm node and one task')
     shard=args.shard if args.shard is not None else int(os.environ['SLURM_ARRAY_TASK_ID'])
-    cases=input_cases(shard,cfg['input'])
+    cases=input_cases(shard,cfg['input'],cfg.get('subset','all'))
     status_path=root/'status'/f'{shard:04d}.json'
     lockpath=root/'locks'/f'{shard:04d}.lock'; lockpath.parent.mkdir(parents=True,exist_ok=True)
     with lockpath.open('a') as lock:
@@ -534,7 +536,7 @@ def prepare_small(args):
     from work.dataset import prepare_small as assemble
     result=assemble(args.output, sources=args.sources, base=args.base)
     print(json.dumps({k:result[k] for k in (
-        'production_count','base_ixc2_count','added_source_dimers','added_source_monomers',
+        'production_count','closed_shell_count','open_shell_count','base_ixc2_count','added_source_dimers','added_source_monomers',
         'exact_duplicates_removed','open_shell_candidates','derived_bond_challenge','nao_tz')},indent=2))
 
 
@@ -542,6 +544,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     sub=p.add_subparsers(dest='command',required=True)
     a=sub.add_parser('prepare'); a.add_argument('--input',default=str(INPUT))
+    a.add_argument('--subset',choices=['all','closed-shell','open-shell'],default='all')
     b=sub.add_parser('submit'); b.add_argument('--execute',action='store_true')
     b.add_argument('--concurrency',type=int,default=24); b.add_argument('--shards')
     b.add_argument('--retry-failed',action='store_true')

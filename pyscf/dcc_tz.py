@@ -450,17 +450,20 @@ def grid(mol, level=5, atom_grid=None):
 
 
 
-def evaluate_group(records, coords):
+def evaluate_group(records, coords, spin=False):
     """Reuse AO evaluations for several methods in the same orbital basis."""
     first = next(iter(records.values()))
     mol = gto.loads(first["meta"]["mol"])
     if any(r["meta"]["mol"] != first["meta"]["mol"] for r in records.values()):
         raise ValueError("Grouped AO evaluation requires identical Mole definitions")
-    values = {m: np.empty(len(coords)) for m in records}
+    values = {m: np.empty((2,len(coords)) if spin else len(coords)) for m in records}
     for start in range(0, len(coords), 2048):
         ao = mol.eval_gto("GTOval_sph", coords[start:start+2048])
         for m, record in records.items():
-            values[m][start:start+len(ao)] = np.einsum("pi,ij,pj->p", ao, record["dm"], ao, optimize=True)
+            dm = record.get('dm_spin') if spin else record['dm']
+            if dm is None:
+                raise ValueError('Requested spin density is absent')
+            values[m][...,start:start+len(ao)] = np.einsum('pi,...ij,pj->...p', ao, dm, ao, optimize=True)
     return values
 
 
@@ -478,11 +481,11 @@ def evaluate_density(record, coords, unrelaxed=False):
 
 
 
-def evaluate_terms(terms,records,coords):
+def evaluate_terms(terms,records,coords,spin=False):
     values={}
     for role in dict.fromkeys(r for _,r,_ in terms):
         methods={m for _,r,m in terms if r==role}
-        for method,value in evaluate_group({m:records[role][m] for m in methods},coords).items():
+        for method,value in evaluate_group({m:records[role][m] for m in methods},coords,spin=spin).items():
             values[role,method]=value
     return sum(c*values[r,m] for c,r,m in terms)
 
@@ -504,17 +507,27 @@ def calculate(case, memory=6000):
 def validate_density(case, records, memory=6000):
     """Check quadrature charge; no HF stability analysis or accuracy claim."""
     mol = make_mol(case, 'aug-cc-pvtz', memory)
+    spin_resolved = bool(case.get('spin', 0))
     history = []
     for level, atom_grid in [(5,None),(6,None),(7,None),(7,(300,1454)),(7,(500,1454))]:
         coords, weights = grid(mol, level, atom_grid)
-        rho = evaluate_terms(TERMS, records, coords)
-        error = float(abs(weights @ rho - mol.nelectron))
-        history.append(dict(level=level, atom_grid=atom_grid, charge_error=error))
+        rho = evaluate_terms(TERMS, records, coords, spin=spin_resolved)
+        counts = rho @ weights
+        total = counts.sum() if spin_resolved else counts
+        error = float(abs(total-mol.nelectron))
+        entry = dict(level=level, atom_grid=atom_grid, charge_error=error)
+        if spin_resolved:
+            spin_error = np.abs(counts-mol.nelec)
+            entry.update(spin_electron_counts=counts.tolist(), spin_charge_errors=spin_error.tolist(),
+                         magnetization_error=float(abs(counts[0]-counts[1]-mol.spin)))
+            error = max(error, float(spin_error.max()), entry['magnetization_error'])
+        history.append(entry)
         if np.isfinite(rho).all() and error < 2e-6:
             break
     if not np.isfinite(rho).all() or error >= 2e-6:
         raise RuntimeError('H3C quadrature failed')
     return dict(recipe='H3C', quality_pass=True, grid_history=history,
+                spin_quality_pass=True if spin_resolved else None,
                 source=source_version(), hf_stability_checked=False,
                 accuracy_certified=False,
                 note='Numerical checks do not establish eta < 1. H3C has an independent C3 failure.')
