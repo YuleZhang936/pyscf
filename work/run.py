@@ -21,6 +21,10 @@ import tempfile
 import time
 import zipfile
 
+# Capture the Slurm step's full mask before importing PySCF/OpenMP: binding
+# narrows the Python main thread to one core, which subprocesses would inherit.
+ALLOCATION_CPU_AFFINITY = sorted(os.sched_getaffinity(0))
+
 from work.dataset import (INPUT, VALIDATION_ARCHIVE, DensityShard, atomic_json, digest,
                           input_cases, input_metadata, prepare_input)
 from pyscf import dcc_tz as method
@@ -275,7 +279,7 @@ def worker(args):
                 job_id=os.environ.get('SLURM_JOB_ID'),host=socket.gethostname(),updated_utc=now(),
                 completed=len(done),total=len(cases),failures=failures,**extra))
         print(json.dumps(dict(shard=shard,resources=res,host=socket.gethostname(),
-                              cpu_affinity=sorted(os.sched_getaffinity(0)))),flush=True)
+                              allocation_cpu_affinity=ALLOCATION_CPU_AFFINITY)),flush=True)
         try:
             for i,case in enumerate(cases):
                 name=case['name']
@@ -298,7 +302,11 @@ def worker(args):
                 # All integrals live on the assigned node and are removed after every molecule.
                 with tempfile.TemporaryDirectory(prefix=name+'-',dir=os.environ['TMPDIR']) as tmp:
                     env=dict(os.environ,TMPDIR=tmp,PYSCF_TMPDIR=tmp)
-                    cmd=[sys.executable,'-u','-m','work.run','molecule','--root',str(root),
+                    # Reset the inherited main-thread mask before the child's
+                    # OpenMP runtime discovers its places. Stay inside srun's
+                    # original allocation; never expand to the entire node.
+                    cmd=['taskset','--cpu-list',','.join(map(str,ALLOCATION_CPU_AFFINITY)),
+                         sys.executable,'-u','-m','work.run','molecule','--root',str(root),
                          '--shard',str(shard),'--index',str(i),'--output',str(output)]
                     child=subprocess.Popen(cmd,env=env,start_new_session=True)
                     timeout=min(cfg['molecule_seconds'],remaining)
@@ -349,7 +357,8 @@ def build_density(case, output, memory=6000, run_id=None):
         validation['production_run_id'] = run_id
         validation['execution'] = dict(host=socket.gethostname(),job_id=os.environ.get('SLURM_JOB_ID'),
             threads=int(os.environ.get('OMP_NUM_THREADS','1')),solver_memory_mb=memory,
-            cpu_affinity=sorted(os.sched_getaffinity(0)))
+            allocation_cpu_affinity=ALLOCATION_CPU_AFFINITY,
+            main_thread_cpu_affinity=sorted(os.sched_getaffinity(0)))
     result = write_bundle(output, case, method.TERMS, records, validation)
     return dict(result, validation=validation)
 
