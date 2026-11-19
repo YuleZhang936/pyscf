@@ -652,7 +652,8 @@ def orbgrad_from_Gamma(mol, auxmol, Gamma, mo_coeff, frozen_mask, max_memory, lo
     nocc_act, _, nvirt = Gamma.shape
     nfrozen = np.count_nonzero(frozen_mask)
     nocc = nfrozen + nocc_act
-    nmo = len(mo_coeff)
+    # Linear-dependency removal can make the AO x MO coefficient matrix rectangular.
+    nmo = mo_coeff.shape[1]
     if nocc + nvirt != nmo:
         raise ValueError('numbers of frozen, occupied and virtual orbitals inconsistent')
 
