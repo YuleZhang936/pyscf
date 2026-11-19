@@ -419,7 +419,7 @@ def label_entry(path, case, run_id):
         if np.max(np.abs(counts-expected)) > 1e-7:
             raise ValueError('Packed density has incorrect spin electron counts')
     return dict(member=case['name']+'.npz',sha256=digest(path),bytes=Path(path).stat().st_size,
-                case_sha256=case_digest(case))
+                case_sha256=case_digest(case), source_datasets=case.get('source_datasets', []))
 
 
 
@@ -1005,6 +1005,9 @@ def prepare_small(output=INPUT, sources=None, base=None):
         open_cases = json.loads(z.read('cases/open_shell.json'))
         atoms = json.loads(z.read('cases/atomic_references.json'))
         base_report = json.loads(z.read('report.json'))
+        observation_member = 'expanded-dispersion-energy-observations.jsonl'
+        observations = {o['id']: o for line in z.read(observation_member).splitlines()
+                        if (o := json.loads(line))}
     for case in cases:
         if size(case) != case['size'] or case['shared_with_heldout']:
             raise ValueError('Invalid reviewed IXC2 case')
@@ -1138,15 +1141,49 @@ def prepare_small(output=INPUT, sources=None, base=None):
             mono['size'] = size(mono)
             (monomers if len(mono['atom']) > 1 else atoms).append(mono)
     cases.extend(open_cases+isolated_open+dimers+monomers)
+    # Carry original dataset identities into every computed label. IXC2 is the
+    # intermediate database, not the original source of these geometries.
+    for case in cases:
+        records = []
+        if 'state_id' in case:
+            for use in case['uses']:
+                obs = observations[use['label']]
+                if obs['terms'].get(case['state_id']) != use['coefficient']:
+                    raise ValueError('IXC2 observation/state provenance mismatch')
+                records.append(dict(dataset=obs['source'], case_name=case['name'],
+                    archive_member='sources/ixc2-small.zip',
+                    archive_sha256=provenance['ixc2-small.zip']['sha256'],
+                    source_member=observation_member, observation_id=obs['id'],
+                    state_id=case['state_id'], database_sha256=base_report['database_sha256'],
+                    molecule_name=obs.get('molecule_name'), curve=obs.get('curve'),
+                    category=obs['category'], transformation='IXC2 energy-observation constituent'))
+            case['source'] = '+'.join(sorted({r['dataset'] for r in records}))
+        else:
+            name = case['source']
+            source_file = (name+'.zip' if name in NCI_SOURCES else
+                           'GMTKN55-open.zip' if name.startswith('GMTKN55/') else
+                           {'A24': 'A24.py', 'O24x5': 'O24by5.py',
+                            'GMTKN55-IL16': 'GMTKN55-IL16_227_struc.xyz'}[name])
+            records.append(dict(dataset=name, case_name=case['name'],
+                archive_member='sources/'+source_file,
+                archive_sha256=provenance[source_file]['sha256'],
+                source_member=case['source_member'], source_url=provenance[source_file]['url'],
+                transformation='fragment extraction' if case.get('role')=='monomer' else 'original geometry',
+                fragment=case.get('fragment'), parent=case.get('parent')))
+        case['provenance'] = records
+        case['source_datasets'] = sorted({r['dataset'] for r in records})
     # Exact Cartesian/charge/spin identity only. No approximate, rotational or
     # permutation merging: all published input geometries remain recoverable.
     unique, identities, aliases = [], {}, {}
     for case in cases:
         key = json.dumps([case['atom'], case['charge'], case['spin']], separators=(',', ':'))
         if key in identities:
-            aliases[case['name']] = identities[key]
+            retained = identities[key]
+            aliases[case['name']] = retained['name']
+            retained['provenance'].extend(case['provenance'])
+            retained['source_datasets'] = sorted(set(retained['source_datasets']+case['source_datasets']))
         else:
-            identities[key] = case['name']
+            identities[key] = case
             unique.append(case)
     cases = unique
     if len({c['name'] for c in cases}) != len(cases):
@@ -1199,6 +1236,7 @@ def prepare_small(output=INPUT, sources=None, base=None):
                  above_300=[c['family'] for c in dimers if c['source']=='O24x5' and c['scaling']==1. and c['size']['nao_tz']>300]),
         charge_counts=dict(Counter(str(c['charge']) for c in cases)),
         source_counts=dict(Counter(c['source'] for c in cases)),
+        original_source_memberships=dict(Counter(s for c in cases for s in c['source_datasets'])),
         nao_tz=dict(max=max(c['size']['nao_tz'] for c in cases),
             quantiles=dict(zip(('p50','p90','p95','p99'),
                 np.quantile([c['size']['nao_tz'] for c in cases], [.5,.9,.95,.99]).tolist())),
@@ -1246,22 +1284,28 @@ def prepare_small(output=INPUT, sources=None, base=None):
         'Changes: size selection, format conversion, fragment extraction, exact duplicate aliases.\n'
         'Derived diatomic scans are separately marked and excluded from production.\n'
     ).encode()
-    # Round-robin AO-size distribution is a scheduling heuristic, not a runtime prediction.
+    # Homogeneous size classes allow multiple single-node workers to share a
+    # node. Round-robin AO size balances shards, without claiming timing data.
     for subset, pool in [('all', cases), ('closed-shell', closed_cases), ('open-shell', open_cases)]:
         prefix = 'dcc' if subset == 'all' else 'dcc/'+subset
-        shards = [[] for _ in range(min(16 if subset=='open-shell' else 64, len(pool)))]
-        for i, case in enumerate(sorted(pool, key=lambda c: (-c['size']['nao_tz'], c['name']))):
-            shards[i % len(shards)].append(case)
+        shards = []
+        for resource_class in ('small', 'standard'):
+            group = [c for c in pool if ('small' if c['size']['nao_tz']<=200 else 'standard')==resource_class]
+            chunks = [[] for _ in range(min(8 if subset=='open-shell' else 128, len(group)))]
+            for i, case in enumerate(sorted(group, key=lambda c: (-c['size']['nao_tz'], c['name']))):
+                chunks[i % len(chunks)].append(case)
+            shards.extend((resource_class, chunk) for chunk in chunks)
         specs = []
-        for i, chunk in enumerate(shards):
+        for i, (resource_class, chunk) in enumerate(shards):
             chunk.sort(key=lambda c: (c['size']['nao_tz'], c['name']))
             member = f'{prefix}/inputs/{i:04d}.jsonl'
             raw = ('\n'.join(json.dumps(c, sort_keys=True, separators=(',', ':')) for c in chunk)+'\n').encode()
             members[member] = raw
-            specs.append(dict(member=member, count=len(chunk), sha256=hashlib.sha256(raw).hexdigest()))
-        add_json(prefix+'/metadata.json', dict(format='dcc-small-input-v2', subset=subset,
+            specs.append(dict(member=member, count=len(chunk), sha256=hashlib.sha256(raw).hexdigest(),
+                              resource_class=resource_class, max_nao_tz=max(c['size']['nao_tz'] for c in chunk)))
+        add_json(prefix+'/metadata.json', dict(format='dcc-small-input-v3', subset=subset,
             count=len(pool), shards=specs, density_labels_included=False, selection_report='report.json',
-            scheduling='AO-size round robin; one molecule per process/node, multiple molecules per job'))
+            scheduling='aTZ<=200 small; aTZ>200 standard; AO-size round robin within each class; one molecule per process/node, multiple molecules per job'))
     add_json('index.json', {n: hashlib.sha256(raw).hexdigest() for n, raw in members.items()})
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_name(output.name+f'.{os.getpid()}.tmp')

@@ -27,6 +27,10 @@ from pyscf import dcc_tz as method
 
 ROOT=Path(__file__).resolve().parent
 RUN=ROOT/'runs/small-density'
+RESOURCES = {
+    'small': dict(threads=4, memory_gib=8, solver_memory_mb=6000),
+    'standard': dict(threads=8, memory_gib=16, solver_memory_mb=12000),
+}
 
 
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -56,11 +60,12 @@ def prepare(args):
         if Path(cfg['input'])!=Path(args.input).resolve(): raise ValueError('Different input dataset')
         if cfg.get('subset', 'all')!=args.subset: raise ValueError('Different input subset; use a new output directory')
     else:
-        cfg=dict(format='dcc-molecular-run-v4',input=str(Path(args.input).resolve()),subset=args.subset,
+        cfg=dict(format='dcc-molecular-run-v5',input=str(Path(args.input).resolve()),subset=args.subset,
                  input_sha256=digest(args.input),runtime=runtime_version(),
                  molecules=meta['count'],shards=len(meta['shards']),codec='packed64',
-                 nodes_per_molecule=1,processes_per_molecule=1,threads=52,
-                 memory_gib=96,solver_memory_mb=60000,virtual_memory_gib=256,
+                 nodes_per_molecule=1,processes_per_molecule=1,
+                 resources=RESOURCES,shard_classes=[s.get('resource_class','standard') for s in meta['shards']],
+                 virtual_memory_gib=256,
                  job_seconds=86400,molecule_seconds=28800,commit_every=8,
                  output_free_floor_gib=100,scratch_free_floor_gib=100,
                  account='limit',partition='cpu')
@@ -71,6 +76,31 @@ def prepare(args):
                           input_bytes=Path(args.input).stat().st_size,
                           output_free_gib=shutil.disk_usage(root).free/2**30,
                           production_submitted=False),indent=2))
+
+
+def shard_resources(cfg, shard):
+    return cfg['resources'][cfg['shard_classes'][shard]]
+
+
+def queued_shards(root, cfg):
+    """Only this run's arrays; never interpret other workloads as density jobs."""
+    submitted = {}
+    for path in (Path(root)/'submissions').glob('*.json'):
+        record = json.loads(path.read_text())
+        if record['run_id'] == cfg['run_id']:
+            submitted[str(record['job_id']).split(';')[0]] = record
+    if not submitted:
+        return {}
+    answer = subprocess.run(['squeue','--me','-r','-h','-o','%F|%K|%T|%R'],
+                            capture_output=True,text=True,check=True)
+    queued = {}
+    for line in answer.stdout.splitlines():
+        array, task, state, reason = line.split('|',3)
+        if array in submitted and task.isdigit():
+            shard = int(task)
+            if shard in queued: raise RuntimeError('Duplicate active shard allocations')
+            queued[shard] = dict(array_job_id=array, task_id=f'{array}_{task}', state=state, reason=reason)
+    return queued
 
 
 def shard_state(root, shard, cfg, deep=False):
@@ -101,6 +131,7 @@ def shard_state(root, shard, cfg, deep=False):
 
 def report(args):
     cfg=load_config(args.root)
+    queued=queued_shards(args.root,cfg)
     rows=[shard_state(args.root,i,cfg,args.verify) for i in range(cfg['shards'])]
     ids=sorted({r['job_id'] for r in rows if r['job_id']})
     accounting={}
@@ -111,9 +142,11 @@ def report(args):
     for r in rows:
         state=accounting.get(r['job_id'],'UNKNOWN').split()[0]
         if r['status']=='running': r['status']='running' if state=='RUNNING' else state.lower()
+        if r['shard'] in queued: r['queue']=queued[r['shard']]
     summary=dict(molecules=cfg['molecules'],committed=sum(r['committed'] for r in rows),
                  pending=sum(r['pending'] for r in rows),failed=sum(r['failed'] for r in rows),
-                 active_shards=[r for r in rows if r['job_id'] or r['committed']],
+                 queued_states={s:sum(r['state']==s for r in queued.values()) for s in sorted({r['state'] for r in queued.values()})},
+                 active_shards=[r for r in rows if r['job_id'] or r['committed'] or r.get('queue')],
                  staged_results_note='Pending includes at most eight staged results per active shard; workers validate and recover them on restart.')
     print(json.dumps(summary,indent=2))
 
@@ -147,34 +180,43 @@ def timing(args):
 
 def submit(args):
     root=Path(args.root).resolve(); cfg=load_config(root)
-    if not 1<=args.concurrency<=24: raise ValueError('Concurrency must be 1..24 CPU nodes')
+    if args.concurrency is not None and args.concurrency<1: raise ValueError('Concurrency must be positive')
     wanted=list(range(cfg['shards'])) if args.shards is None else [int(v) for v in args.shards.split(',')]
     if not wanted or len(set(wanted))!=len(wanted) or any(i<0 or i>=cfg['shards'] for i in wanted):
         raise ValueError('Invalid shard selection')
+    queued=queued_shards(root,cfg)
     pending=[]
     for i in wanted:
+        if i in queued: continue
         state=shard_state(root,i,cfg)
         if state['pending'] and (args.retry_failed or state['pending']>state['failed']): pending.append(i)
     if not pending:
         print('No pending work. Failed cases require --retry-failed.'); return
     if shutil.disk_usage(root).free<cfg['output_free_floor_gib']*2**30:
         raise RuntimeError('Output filesystem is below its free-space reserve')
-    cmd=['sbatch','--parsable',f'--account={cfg["account"]}',f'--partition={cfg["partition"]}',
-         '--nodes=1','--ntasks=1',f'--cpus-per-task={cfg["threads"]}','--hint=nomultithread',
-         '--exclusive',f'--mem={cfg["memory_gib"]}G','--time=1-00:00:00',
-         '--signal=B:USR1@180','--requeue','--open-mode=append','--job-name=dcc-density',
-         '--array='+','.join(map(str,pending))+f'%{args.concurrency}',
-         '--chdir='+str(ROOT.parent),'--output='+str(root/'logs/%A_%a.log'),
-         ]
+    groups={name:[i for i in pending if cfg['shard_classes'][i]==name] for name in cfg['resources']}
+    groups={name:shards for name,shards in groups.items() if shards}
+    if args.concurrency is not None and args.concurrency<len(groups):
+        raise ValueError('Concurrency must allow at least one task per resource class, or select --shards')
     script=production_script(root,args.retry_failed)
-    print(shlex.join(cmd),flush=True)
-    if not args.execute:
-        print('Preview only: no jobs submitted. Add --execute to submit.'); return
-    (root/'logs').mkdir(parents=True,exist_ok=True)
-    answer=subprocess.run(cmd,input=script,capture_output=True,text=True,check=True).stdout.strip()
-    atomic_json(root/'submissions'/(answer.split(';')[0]+'.json'),
-                dict(utc=now(),command=cmd,script=script,job_id=answer,run_id=cfg['run_id']))
-    print('Submitted '+answer)
+    for group_index,(name,shards) in enumerate(groups.items()):
+        res=cfg['resources'][name]
+        cap=(args.concurrency//len(groups)+(group_index<args.concurrency%len(groups))) if args.concurrency is not None else len(shards)
+        cmd=['sbatch','--parsable',f'--account={cfg["account"]}',f'--partition={cfg["partition"]}',
+             '--nodes=1','--ntasks=1',f'--cpus-per-task={res["threads"]}','--hint=nomultithread',
+             f'--mem={res["memory_gib"]}G','--time=1-00:00:00',
+             '--signal=B:USR1@180','--requeue','--open-mode=append','--job-name=dcc-'+name,
+             '--array='+','.join(map(str,shards))+f'%{min(cap,len(shards))}',
+             '--chdir='+str(ROOT.parent),'--output='+str(root/'logs/%A_%a.log')]
+        print(shlex.join(cmd),flush=True)
+        if not args.execute: continue
+        (root/'logs').mkdir(parents=True,exist_ok=True)
+        answer=subprocess.run(cmd,input=script,capture_output=True,text=True,check=True).stdout.strip()
+        atomic_json(root/'submissions'/(answer.split(';')[0]+'.json'),
+                    dict(utc=now(),command=cmd,script=script,job_id=answer,run_id=cfg['run_id'],
+                         shards=shards,resource_class=name,resources=res))
+        print('Submitted '+answer,flush=True)
+    if not args.execute: print('Preview only: no jobs submitted. Add --execute to submit.')
 
 
 def molecule(args):
@@ -183,12 +225,15 @@ def molecule(args):
     from work.dataset import write_compact, read_compact, source_blocks
     import numpy as np
     cfg=load_config(args.root)
+    res=shard_resources(cfg,args.shard)
     case=input_cases(args.shard,cfg['input'],cfg.get('subset','all'))[args.index]
-    lib.num_threads(int(os.environ.get('SLURM_CPUS_PER_TASK',str(cfg['threads']))))
+    if int(os.environ.get('SLURM_CPUS_PER_TASK','0'))!=res['threads']:
+        raise RuntimeError('Allocated CPU count differs from the shard configuration')
+    lib.num_threads(res['threads'])
     def progress(stage,event): print(now(),case['name'],stage,event,flush=True)
     with tempfile.TemporaryDirectory(prefix='density-',dir=os.environ['TMPDIR']) as tmp:
         raw=Path(tmp)/'components.npz'
-        with stage_reporting(progress): build_density(case,raw,cfg['solver_memory_mb'],cfg['run_id'])
+        with stage_reporting(progress): build_density(case,raw,res['solver_memory_mb'],cfg['run_id'])
         write_compact(raw,args.output,mode='packed64')
         _,original=source_blocks(raw); _,restored=read_compact(args.output)
         if not all(np.array_equal(a['dm'],b['dm']) and np.array_equal(a['dm_spin'],b['dm_spin'])
@@ -202,6 +247,7 @@ def worker(args):
     if int(os.environ.get('SLURM_JOB_NUM_NODES','0'))!=1 or int(os.environ.get('SLURM_NTASKS','0'))!=1:
         raise RuntimeError('Worker requires one Slurm node and one task')
     shard=args.shard if args.shard is not None else int(os.environ['SLURM_ARRAY_TASK_ID'])
+    res=shard_resources(cfg,shard)
     cases=input_cases(shard,cfg['input'],cfg.get('subset','all'))
     status_path=root/'status'/f'{shard:04d}.json'
     lockpath=root/'locks'/f'{shard:04d}.lock'; lockpath.parent.mkdir(parents=True,exist_ok=True)
@@ -217,7 +263,7 @@ def worker(args):
         failures=state.get('failures',{})
         done=store.completed()
         failures={k:v for k,v in failures.items() if k not in done}
-        started=time.monotonic(); stopping=False; cancelled=False; child=None
+        started=time.monotonic(); stopping=False; cancelled=False; child=None; blocked=None
         retry_failed=args.retry_failed and int(os.environ.get('SLURM_RESTART_COUNT','0'))==0
         def stop(signum,frame):
             nonlocal stopping,cancelled
@@ -228,6 +274,8 @@ def worker(args):
             atomic_json(status_path,dict(run_id=cfg['run_id'],shard=shard,status=status,
                 job_id=os.environ.get('SLURM_JOB_ID'),host=socket.gethostname(),updated_utc=now(),
                 completed=len(done),total=len(cases),failures=failures,**extra))
+        print(json.dumps(dict(shard=shard,resources=res,host=socket.gethostname(),
+                              cpu_affinity=sorted(os.sched_getaffinity(0)))),flush=True)
         try:
             for i,case in enumerate(cases):
                 name=case['name']
@@ -235,9 +283,15 @@ def worker(args):
                 remaining=cfg['job_seconds']-(time.monotonic()-started)-300
                 if stopping or remaining<60: break
                 if shutil.disk_usage(root).free<cfg['output_free_floor_gib']*2**30:
-                    save('storage_low'); return
+                    blocked='storage_low'; break
                 if shutil.disk_usage(os.environ['TMPDIR']).free<cfg['scratch_free_floor_gib']*2**30:
-                    save('scratch_low'); return
+                    blocked='scratch_low'; break
+                # This cluster schedules cores, not memory. Check actual free
+                # RAM before starting another molecule on a shared node.
+                available=int(next(line.split()[1] for line in Path('/proc/meminfo').read_text().splitlines()
+                                   if line.startswith('MemAvailable:')))*1024
+                if available<(res['memory_gib']+2)*2**30:
+                    blocked='memory_low'; break
                 output=store.stage/(name+'.npz')
                 save('running',active_case=name)
                 begin=time.monotonic(); interrupted=False
@@ -271,7 +325,7 @@ def worker(args):
                 if len(list(store.stage.glob('*.npz')))>=cfg['commit_every']: store.commit()
                 if interrupted: break
             store.commit()
-            save('completed' if len(done)==len(cases) else 'cancelled' if cancelled else 'partial')
+            save('completed' if len(done)==len(cases) else 'cancelled' if cancelled else blocked or 'partial')
         except BaseException as exc:
             if child is not None and child.poll() is None:
                 os.killpg(child.pid,signal.SIGKILL); child.wait()
@@ -293,6 +347,9 @@ def build_density(case, output, memory=6000, run_id=None):
     validation = method.validate_density(case, records, memory)
     if run_id is not None:
         validation['production_run_id'] = run_id
+        validation['execution'] = dict(host=socket.gethostname(),job_id=os.environ.get('SLURM_JOB_ID'),
+            threads=int(os.environ.get('OMP_NUM_THREADS','1')),solver_memory_mb=memory,
+            cpu_affinity=sorted(os.sched_getaffinity(0)))
     result = write_bundle(output, case, method.TERMS, records, validation)
     return dict(result, validation=validation)
 
@@ -420,8 +477,9 @@ set -euo pipefail
 ulimit -c 0
 source .local/activate.sh
 export PYTHONDONTWRITEBYTECODE=1
+export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK" OMP_THREAD_LIMIT="$SLURM_CPUS_PER_TASK" OMP_DYNAMIC=FALSE
 export OMP_PLACES=cores OMP_PROC_BIND=spread OMP_WAIT_POLICY=PASSIVE
-export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 test "${SLURM_JOB_NUM_NODES}" = 1
 test "${SLURM_NTASKS}" = 1
 ulimit -v $((256 * 1024 * 1024))
@@ -434,7 +492,8 @@ task_stop() { if [[ -n "$task_pid" ]]; then kill "-$1" "$task_pid" 2>/dev/null |
 trap 'task_stop USR1' USR1
 trap 'task_stop TERM' TERM INT
 trap 'rm -rf -- "$task_scratch"' EXIT
-python -u -m work.run worker --root @ROOT@ @RETRY@ &
+srun --nodes=1 --ntasks=1 --cpus-per-task="$SLURM_CPUS_PER_TASK" --exact --cpu-bind=cores \
+    python -u -m work.run worker --root @ROOT@ @RETRY@ &
 task_pid=$!
 task_result=0
 # wait can be interrupted by the signal trap while the worker flushes its shard.
@@ -445,6 +504,7 @@ done
 if [[ "$task_result" = 75 ]]; then
     # Successful checkpoints survive the daily allocation boundary. A manual
     # cancellation exits 130 and never requeues itself.
+    sleep 30
     scontrol requeue "${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
     exit 0
 fi
@@ -546,7 +606,7 @@ def main():
     a=sub.add_parser('prepare'); a.add_argument('--input',default=str(INPUT))
     a.add_argument('--subset',choices=['all','closed-shell','open-shell'],default='all')
     b=sub.add_parser('submit'); b.add_argument('--execute',action='store_true')
-    b.add_argument('--concurrency',type=int,default=24); b.add_argument('--shards')
+    b.add_argument('--concurrency',type=int,help='Optional array-task cap; default lets Slurm fill available CPU quota'); b.add_argument('--shards')
     b.add_argument('--retry-failed',action='store_true')
     c=sub.add_parser('report'); c.add_argument('--verify',action='store_true')
     sub.add_parser('timing')
