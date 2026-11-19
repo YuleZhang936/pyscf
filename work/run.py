@@ -51,7 +51,21 @@ def load_config(root, verify=True):
     expected=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
     if cfg['run_id']!=expected: raise ValueError('Run configuration was edited; use a new output directory')
     if verify:
-        if runtime_version()!=cfg['runtime']: raise ValueError('Run/source or solver-default mismatch')
+        actual=runtime_version()
+        policy_path=Path(root)/'runtime-policy.json'
+        if policy_path.exists():
+            policy=json.loads(policy_path.read_text())
+            # An explicitly recorded scheduler-only patch can keep completed
+            # labels. Input, method, codec and all numerical settings stay locked.
+            if (policy['run_id']!=cfg['run_id'] or policy['original_runtime']!=cfg['runtime']
+                    or policy['runtime']!=actual
+                    or actual['method']!=cfg['runtime']['method']
+                    or actual['workflow_sha256']['dataset.py']!=cfg['runtime']['workflow_sha256']['dataset.py']
+                    or set(policy['overrides'])!={'scratch_free_floor_gib'}
+                    or not 10<=policy['overrides']['scratch_free_floor_gib']<=100):
+                raise ValueError('Invalid scheduler-only runtime policy')
+            cfg.update(policy['overrides'])
+        elif actual!=cfg['runtime']: raise ValueError('Run/source or solver-default mismatch')
         if digest(cfg['input'])!=cfg['input_sha256']: raise ValueError('Input dataset checksum mismatch')
     return cfg
 
@@ -71,7 +85,7 @@ def prepare(args):
                  resources=RESOURCES,shard_classes=[s.get('resource_class','standard') for s in meta['shards']],
                  virtual_memory_gib=256,
                  job_seconds=86400,molecule_seconds=28800,commit_every=8,
-                 output_free_floor_gib=100,scratch_free_floor_gib=100,
+                 output_free_floor_gib=100,scratch_free_floor_gib=10,
                  account='limit',partition='cpu')
         cfg['run_id']=hashlib.sha256(json.dumps(cfg,sort_keys=True).encode()).hexdigest()
         cfg['created_utc']=now()
@@ -358,7 +372,8 @@ def build_density(case, output, memory=6000, run_id=None):
         validation['execution'] = dict(host=socket.gethostname(),job_id=os.environ.get('SLURM_JOB_ID'),
             threads=int(os.environ.get('OMP_NUM_THREADS','1')),solver_memory_mb=memory,
             allocation_cpu_affinity=ALLOCATION_CPU_AFFINITY,
-            main_thread_cpu_affinity=sorted(os.sched_getaffinity(0)))
+            main_thread_cpu_affinity=sorted(os.sched_getaffinity(0)),
+            workflow_sha256=runtime_version()['workflow_sha256'])
     result = write_bundle(output, case, method.TERMS, records, validation)
     return dict(result, validation=validation)
 
