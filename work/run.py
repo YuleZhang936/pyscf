@@ -26,7 +26,7 @@ from work.dataset import (INPUT, VALIDATION_ARCHIVE, DensityShard, atomic_json, 
 from pyscf import dcc_tz as method
 
 ROOT=Path(__file__).resolve().parent
-RUN=ROOT/'runs/qm9'
+RUN=ROOT/'runs/small-density'
 
 
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -44,7 +44,7 @@ def load_config(root, verify=True):
     if cfg['run_id']!=expected: raise ValueError('Run configuration was edited; use a new output directory')
     if verify:
         if runtime_version()!=cfg['runtime']: raise ValueError('Run/source or solver-default mismatch')
-        if digest(cfg['input'])!=cfg['input_sha256']: raise ValueError('QM9 input checksum mismatch')
+        if digest(cfg['input'])!=cfg['input_sha256']: raise ValueError('Input dataset checksum mismatch')
     return cfg
 
 
@@ -55,7 +55,7 @@ def prepare(args):
         cfg=load_config(root)
         if Path(cfg['input'])!=Path(args.input).resolve(): raise ValueError('Different input dataset')
     else:
-        cfg=dict(format='dcc-qm9-run-v2',input=str(Path(args.input).resolve()),
+        cfg=dict(format='dcc-molecular-run-v3',input=str(Path(args.input).resolve()),
                  input_sha256=digest(args.input),runtime=runtime_version(),
                  molecules=meta['count'],shards=len(meta['shards']),codec='packed64',
                  nodes_per_molecule=1,processes_per_molecule=1,threads=52,
@@ -161,7 +161,7 @@ def submit(args):
     cmd=['sbatch','--parsable',f'--account={cfg["account"]}',f'--partition={cfg["partition"]}',
          '--nodes=1','--ntasks=1',f'--cpus-per-task={cfg["threads"]}','--hint=nomultithread',
          '--exclusive',f'--mem={cfg["memory_gib"]}G','--time=1-00:00:00',
-         '--signal=B:USR1@180','--requeue','--open-mode=append','--job-name=dcc-qm9',
+         '--signal=B:USR1@180','--requeue','--open-mode=append','--job-name=dcc-density',
          '--array='+','.join(map(str,pending))+f'%{args.concurrency}',
          '--chdir='+str(ROOT.parent),'--output='+str(root/'logs/%A_%a.log'),
          ]
@@ -530,6 +530,14 @@ PY
 
 
 
+def prepare_small(args):
+    from work.dataset import prepare_small as assemble
+    result=assemble(args.output, sources=args.sources, base=args.base)
+    print(json.dumps({k:result[k] for k in (
+        'production_count','base_ixc2_count','added_source_dimers','added_source_monomers',
+        'exact_duplicates_removed','open_shell_candidates','derived_bond_challenge','nao_tz')},indent=2))
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     sub=p.add_subparsers(dest='command',required=True)
@@ -551,7 +559,7 @@ def main():
     g.add_argument('--index',type=int,required=True); g.add_argument('--output',required=True)
     g.add_argument('--memory',type=int,default=6000); g.add_argument('--threads',type=int,default=1)
     h=sub.add_parser('submit-timing'); h.add_argument('--index',type=int,required=True)
-    h.add_argument('--manifest',default='work/data/h3c-qm9-timing-v1.json')
+    h.add_argument('--manifest',required=True)
     h.add_argument('--threads',type=int,choices=[1,52],required=True)
     h.add_argument('--root',required=True); h.add_argument('--node')
     h.add_argument('--execute',action='store_true')
@@ -559,6 +567,10 @@ def main():
     i.add_argument('--output',default=str(ROOT/'data/ixc2-small.zip'))
     i.add_argument('--max-heavy',type=int,default=3)
     i.add_argument('--max-nao',type=int,default=200)
+    j=sub.add_parser('prepare-small',help='Assemble pinned public geometries; no quantum calculations')
+    j.add_argument('--output',default=str(INPUT))
+    j.add_argument('--sources',help='Optional directory of already downloaded, checksum-pinned sources')
+    j.add_argument('--base',default=str(ROOT/'data/ixc2-small.zip'))
     args=p.parse_args(); globals()[args.command.replace('-', '_')](args)
 
 

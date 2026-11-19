@@ -2,7 +2,7 @@ __pycache__/
 .pytest_cache/
 runs/
 data/*.zip
-!data/ixc2-small.zip
+!data/small-density.zip
 *.npz
 *.h5
 *.chk
